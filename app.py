@@ -1263,29 +1263,76 @@ def exit_tier(exit_score):
     return 0, "🟢 Hold — trend intact"
 
 
-# Local exchange close times (tz name, hour, minute).
-MARKET_CLOSE = {
-    "US": ("America/New_York", 16, 0),
-    "India": ("Asia/Kolkata", 15, 30),
+# Local exchange trading hours: tz name, (open h, m), (close h, m).
+MARKET_HOURS = {
+    "US": ("America/New_York", (9, 30), (16, 0)),
+    "India": ("Asia/Kolkata", (9, 15), (15, 30)),
 }
+ACTION_WINDOW_MIN = 30  # act within this many minutes of a bar close
 
 
-def minutes_to_close(market):
-    """Minutes until `market` closes today. None on weekends / unknown tz."""
-    spec = MARKET_CLOSE.get(market)
+def _primary_tf(timeframes) -> str:
+    """The highest (longest) timeframe drives the action cadence."""
+    for tf in ("1wk", "1d", "4h"):
+        if tf in timeframes:
+            return tf
+    return "1d"
+
+
+def bar_close_status(market, timeframes):
+    """(message, in_window) describing when to act, based on the selected
+    timeframe's bar cadence at this market rather than a fixed daily close.
+
+    * 4h  → next 4-hour bar close within the session
+    * 1d  → the daily close
+    * 1wk → the weekly close (Friday)
+    """
+    tf = _primary_tf(timeframes)
+    label = {"4h": "4-hour", "1d": "daily", "1wk": "weekly"}[tf]
+    spec = MARKET_HOURS.get(market)
     if not spec:
-        return None
-    tzname, hh, mm = spec
+        return (f"{market} ({label} bar): schedule unknown", False)
+    tzname, (oh, om), (ch, cm) = spec
     try:
         from zoneinfo import ZoneInfo
         import datetime as _d
         now = _d.datetime.now(ZoneInfo(tzname))
-        if now.weekday() >= 5:  # Sat/Sun
-            return None
-        close = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        return int((close - now).total_seconds() // 60)
     except Exception:
-        return None
+        return (f"{market} ({label} bar): timezone unavailable", False)
+
+    dow = now.weekday()  # 0=Mon … 6=Sun
+    if dow >= 5:
+        return (f"{market} ({label} bar): market closed (weekend)", False)
+
+    close_today = now.replace(hour=ch, minute=cm, second=0, microsecond=0)
+    open_today = now.replace(hour=oh, minute=om, second=0, microsecond=0)
+
+    if tf == "1wk":
+        if dow < 4:  # Mon–Thu
+            days = 4 - dow
+            return (f"{market} (weekly bar): act Friday near close (~{days}d away)", False)
+        mins = int((close_today - now).total_seconds() // 60)  # Friday
+        if mins < 0:
+            return (f"{market} (weekly bar): Friday session closed", False)
+        return (f"{market} (weekly bar): {mins} min to Friday close",
+                mins <= ACTION_WINDOW_MIN)
+
+    # Build today's bar-close times for 4h / 1d.
+    if tf == "4h":
+        closes, t = [], open_today
+        while t < close_today:
+            t = t + _d.timedelta(hours=4)
+            closes.append(min(t, close_today))
+        closes = sorted(set(closes))
+    else:  # 1d
+        closes = [close_today]
+
+    upcoming = [c for c in closes if (c - now).total_seconds() > -60]
+    if not upcoming:
+        return (f"{market} ({label} bar): closed for today", False)
+    mins = int((upcoming[0] - now).total_seconds() // 60)
+    return (f"{market} ({label} bar): {mins} min to next bar close",
+            mins <= ACTION_WINDOW_MIN)
 
 
 def daily_action(sc):
@@ -1472,10 +1519,11 @@ with tab_sip:
     st.markdown("### 2️⃣ Exit plan — your holdings")
     st.caption(
         "Upload your positions CSV (Schwab US *Individual-Positions…* or Zerodha "
-        "India *holdings…*) **daily, ~30 min before close**. For each holding you get "
-        "a **two-sided action** — 🟢 add more (with %) while the setup is still "
-        "building, or 🟠/🔴 trim/exit (with %) at that day's target — plus a detailed "
-        "targets & stops reference below."
+        "India *holdings…*) and act **near each bar close of the selected timeframe** "
+        "(4h / daily / weekly — set it in the sidebar). For each holding you get a "
+        "**two-sided action** — 🟢 add more (with %) while the setup is still building, "
+        "or 🟠/🔴 trim/exit (with %) at that bar's target — plus a detailed targets & "
+        "stops reference below."
     )
 
     up = st.file_uploader("Upload positions CSV", type=["csv"], key="pos_upload")
@@ -1562,7 +1610,7 @@ with tab_sip:
                         "Adjust %": act["pct"] if act["side"] != "hold" else 0,
                         "Shares Δ": shares_delta,
                         "At price": a_price,
-                        "Target today": act["day_target"],
+                        "Bar target": act["day_target"],
                         f"Cash Δ {sym}": cash_delta,
                         "Breakout": sc.get("breakout"),
                         "Exit score": sc.get("exit_score"),
@@ -1589,27 +1637,22 @@ with tab_sip:
                         "Trail stop @": sc.get("stop"),
                     })
 
-            # ============ Daily two-sided action plan (run ~30 min pre-close) ===
-            st.markdown("#### 🕒 Today's action plan — add / trim / exit")
+            # ===== Timeframe-based action plan (cadence = selected timeframe) ===
+            _tf_lbl = {"4h": "4-hour", "1d": "daily", "1wk": "weekly"}[_primary_tf(selected_tf)]
+            st.markdown(f"#### 🕒 {_tf_lbl.capitalize()} action plan — add / trim / exit")
             markets_held = sorted({r["Market"] for r in action_rows})
             close_bits = []
             in_window = False
             for mk in markets_held:
-                mins = minutes_to_close(mk)
-                if mins is None:
-                    close_bits.append(f"**{mk}**: market closed / weekend")
-                elif mins < 0:
-                    close_bits.append(f"**{mk}**: closed for today")
-                else:
-                    close_bits.append(f"**{mk}**: {mins} min to close")
-                    if 0 <= mins <= 30:
-                        in_window = True
+                msg, win = bar_close_status(mk, selected_tf)
+                close_bits.append(msg)
+                in_window = in_window or win
             if close_bits:
                 (st.success if in_window else st.info)(
                     " · ".join(close_bits)
-                    + ("  — ✅ you're in the last-30-min action window."
+                    + (f"  — ✅ you're in the last-{ACTION_WINDOW_MIN}-min action window."
                        if in_window else
-                       "  — best run this within 30 min of close.")
+                       f"  — act within {ACTION_WINDOW_MIN} min of the {_tf_lbl} bar close.")
                 )
 
             act_df = pd.DataFrame(action_rows)
@@ -1620,11 +1663,11 @@ with tab_sip:
             n_add = sum(1 for r in todo if r["_side"] == "add")
             n_out = sum(1 for r in todo if r["_side"] in ("trim", "exit"))
             st.caption(
-                f"**{len(todo)} action(s) today** — 🟢 {n_add} to add, 🔴/🟠 {n_out} to "
+                f"**{len(todo)} action(s)** — 🟢 {n_add} to add, 🔴/🟠 {n_out} to "
                 f"trim/exit; the rest are HOLD. **Adjust %** = how much of the position "
-                "to add (buy a ~1% intraday dip) or trim (sell at price). **Target "
-                "today** = the level you're playing for. **Cash Δ** is negative when "
-                "you deploy cash, positive when you free it."
+                "to add (buy a ~1% dip) or trim (sell at price). **Bar target** = the "
+                f"level you're playing for over this {_tf_lbl} bar. **Cash Δ** is "
+                "negative when you deploy cash, positive when you free it."
             )
             st.dataframe(
                 act_df, use_container_width=True, hide_index=True,
@@ -1641,14 +1684,14 @@ with tab_sip:
             )
             ac_dl, ac_email = st.columns([1, 1])
             ac_dl.download_button(
-                "⬇️ Download today's action plan",
+                "⬇️ Download this action plan",
                 act_df.to_csv(index=False).encode(),
-                file_name="daily_action_plan.csv", mime="text/csv",
+                file_name=f"{_primary_tf(selected_tf)}_action_plan.csv", mime="text/csv",
             )
             _cfg = alertmod.load_config()
             if ac_email.button("📧 Email me this plan", disabled=not alertmod.config_ready(_cfg)):
                 if not todo:
-                    lines = ["No actions today — everything is HOLD."]
+                    lines = ["No actions — everything is HOLD."]
                 else:
                     lines = []
                     for r in todo:
@@ -1659,17 +1702,18 @@ with tab_sip:
                         lines.append(
                             f"{r['Action']}  {r['Symbol']} ({r['Market']}): "
                             f"{r['Adjust %']}%  {sd_str} sh @ {r['At price']} "
-                            f"→ target {r['Target today']}"
+                            f"→ target {r['Bar target']}"
                             + (f"  cash {sym}{cash:+}" if isinstance(cash, (int, float)) else "")
                         )
                 body = (
-                    "Daily action plan (run ~30 min before close)\n\n"
+                    f"{_tf_lbl.capitalize()} action plan "
+                    f"(act near the {_tf_lbl} bar close)\n\n"
                     + "\n".join(lines)
                     + "\n\nEducational info, not investment advice."
                 )
                 try:
                     alertmod.send_email(
-                        _cfg, f"📈 Daily action plan — {len(todo)} action(s)", body)
+                        _cfg, f"📈 {_tf_lbl.capitalize()} action plan — {len(todo)} action(s)", body)
                     st.success("Emailed your action plan.")
                 except Exception as exc:
                     st.error(f"Couldn't send email: {exc}")
