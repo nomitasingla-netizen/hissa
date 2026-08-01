@@ -1263,6 +1263,65 @@ def exit_tier(exit_score):
     return 0, "🟢 Hold — trend intact"
 
 
+# Local exchange close times (tz name, hour, minute).
+MARKET_CLOSE = {
+    "US": ("America/New_York", 16, 0),
+    "India": ("Asia/Kolkata", 15, 30),
+}
+
+
+def minutes_to_close(market):
+    """Minutes until `market` closes today. None on weekends / unknown tz."""
+    spec = MARKET_CLOSE.get(market)
+    if not spec:
+        return None
+    tzname, hh, mm = spec
+    try:
+        from zoneinfo import ZoneInfo
+        import datetime as _d
+        now = _d.datetime.now(ZoneInfo(tzname))
+        if now.weekday() >= 5:  # Sat/Sun
+            return None
+        close = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return int((close - now).total_seconds() // 60)
+    except Exception:
+        return None
+
+
+def daily_action(sc):
+    """End-of-day two-sided decision for one holding.
+
+    Returns dict(side, label, pct, act_price, day_target) where side is one of
+    add / trim / exit / hold. ADD when the setup is still building (strong
+    breakout, low exit) and price is above its stop but below the first target;
+    TRIM at the first target or a rising exit score; EXIT when over-extended.
+    """
+    b = sc.get("breakout") or 0
+    e = sc.get("exit_score") or 0
+    rsi = sc.get("rsi") or 0
+    price = sc.get("price")
+    t1 = sc.get("target1")
+    t2 = sc.get("target")
+    stop = sc.get("stop")
+
+    if e >= 65 or rsi >= 80 or (t2 and price and price >= t2):
+        return {"side": "exit", "label": "🔴 EXIT — over-extended",
+                "pct": 100, "act_price": price, "day_target": t2 or price}
+    if e >= 50 or (t1 and price and price >= t1):
+        return {"side": "trim", "label": "🟠 TRIM — book partial",
+                "pct": 40, "act_price": price, "day_target": t1 or price}
+    if e >= 40:
+        return {"side": "trim", "label": "🟡 TRIM light — watch",
+                "pct": 25, "act_price": price, "day_target": t1 or price}
+    if b >= 58 and e < 45 and price and stop and price > stop and (not t1 or price < t1):
+        add_pct = 30 if b >= 70 else 20 if b >= 64 else 10
+        return {"side": "add", "label": "🟢 ADD — accumulate",
+                "pct": add_pct, "act_price": round(price * 0.99, 2),
+                "day_target": t1 or price}
+    return {"side": "hold", "label": "⚪ HOLD — do nothing",
+            "pct": 0, "act_price": price, "day_target": t1 or price}
+
+
 with tab_sip:
     st.subheader("📅 SIP & Exit Plan — weekly-primary rotation (~5%/month)")
     st.caption(
@@ -1413,8 +1472,10 @@ with tab_sip:
     st.markdown("### 2️⃣ Exit plan — your holdings")
     st.caption(
         "Upload your positions CSV (Schwab US *Individual-Positions…* or Zerodha "
-        "India *holdings…*). For each holding it computes an **exit score** and tells "
-        "you **what % to scale out at what price**."
+        "India *holdings…*) **daily, ~30 min before close**. For each holding you get "
+        "a **two-sided action** — 🟢 add more (with %) while the setup is still "
+        "building, or 🟠/🔴 trim/exit (with %) at that day's target — plus a detailed "
+        "targets & stops reference below."
     )
 
     up = st.file_uploader("Upload positions CSV", type=["csv"], key="pos_upload")
@@ -1453,6 +1514,7 @@ with tab_sip:
         else:
             st.caption(f"Detected **{fmt.upper()}** format — {len(positions)} holdings.")
             exit_rows = []
+            action_rows = []
             with st.spinner("Scoring your holdings…"):
                 for p in positions:
                     try:
@@ -1466,6 +1528,10 @@ with tab_sip:
                             "Exit score": None, "Action": "❔ No data",
                             "Exit %": None, "Sell @": p.get("ltp"),
                         })
+                        action_rows.append({
+                            "Symbol": p["symbol"], "Market": p["market"],
+                            "Action": "❔ No data", "_side": "hold",
+                        })
                         continue
                     pct, label = exit_tier(sc["exit_score"])
                     price = sc["price"] or p.get("ltp")
@@ -1473,6 +1539,36 @@ with tab_sip:
                     exit_qty = int(round(qty * pct / 100)) if qty else None
                     sym = CCY_SYM.get(p["market"], "")
                     free_val = round(exit_qty * price, 2) if (exit_qty and price) else None
+
+                    # ---- Daily two-sided action (add / trim / exit / hold) ----
+                    act = daily_action(sc)
+                    a_price = act["act_price"] or price
+                    shares = int(round(qty * act["pct"] / 100)) if qty else None
+                    if act["side"] == "add":
+                        shares_delta = shares                       # buy more
+                        cash_delta = -round(shares * a_price, 2) if (shares and a_price) else None
+                    elif act["side"] in ("trim", "exit"):
+                        shares_delta = -shares if shares else None   # sell
+                        cash_delta = round(shares * a_price, 2) if (shares and a_price) else None
+                    else:
+                        shares_delta, cash_delta = 0, 0
+                    action_rows.append({
+                        "Ticker": tradingview_url(p["yf"]),
+                        "Symbol": p["symbol"],
+                        "Market": p["market"],
+                        "Qty held": qty,
+                        "Gain %": p.get("gain_pct"),
+                        "Action": act["label"],
+                        "Adjust %": act["pct"] if act["side"] != "hold" else 0,
+                        "Shares Δ": shares_delta,
+                        "At price": a_price,
+                        "Target today": act["day_target"],
+                        f"Cash Δ {sym}": cash_delta,
+                        "Breakout": sc.get("breakout"),
+                        "Exit score": sc.get("exit_score"),
+                        "RSI": sc.get("rsi"),
+                        "_side": act["side"],
+                    })
                     exit_rows.append({
                         "Ticker": tradingview_url(p["yf"]),
                         "Symbol": p["symbol"],
@@ -1492,6 +1588,96 @@ with tab_sip:
                         "T2 (runner)": sc.get("target"),
                         "Trail stop @": sc.get("stop"),
                     })
+
+            # ============ Daily two-sided action plan (run ~30 min pre-close) ===
+            st.markdown("#### 🕒 Today's action plan — add / trim / exit")
+            markets_held = sorted({r["Market"] for r in action_rows})
+            close_bits = []
+            in_window = False
+            for mk in markets_held:
+                mins = minutes_to_close(mk)
+                if mins is None:
+                    close_bits.append(f"**{mk}**: market closed / weekend")
+                elif mins < 0:
+                    close_bits.append(f"**{mk}**: closed for today")
+                else:
+                    close_bits.append(f"**{mk}**: {mins} min to close")
+                    if 0 <= mins <= 30:
+                        in_window = True
+            if close_bits:
+                (st.success if in_window else st.info)(
+                    " · ".join(close_bits)
+                    + ("  — ✅ you're in the last-30-min action window."
+                       if in_window else
+                       "  — best run this within 30 min of close.")
+                )
+
+            act_df = pd.DataFrame(action_rows)
+            side_order = {"exit": 0, "trim": 1, "add": 2, "hold": 3}
+            act_df["_o"] = act_df["_side"].map(side_order).fillna(3)
+            act_df = act_df.sort_values("_o").drop(columns=["_o", "_side"]).reset_index(drop=True)
+            todo = [r for r in action_rows if r["_side"] in ("add", "trim", "exit")]
+            n_add = sum(1 for r in todo if r["_side"] == "add")
+            n_out = sum(1 for r in todo if r["_side"] in ("trim", "exit"))
+            st.caption(
+                f"**{len(todo)} action(s) today** — 🟢 {n_add} to add, 🔴/🟠 {n_out} to "
+                f"trim/exit; the rest are HOLD. **Adjust %** = how much of the position "
+                "to add (buy a ~1% intraday dip) or trim (sell at price). **Target "
+                "today** = the level you're playing for. **Cash Δ** is negative when "
+                "you deploy cash, positive when you free it."
+            )
+            st.dataframe(
+                act_df, use_container_width=True, hide_index=True,
+                column_config={
+                    "Ticker": st.column_config.LinkColumn(
+                        "Ticker", display_text=r"symbol=(.+)$"),
+                    "Adjust %": st.column_config.NumberColumn("Adjust %", format="%d%%"),
+                    "Gain %": st.column_config.NumberColumn("Gain %", format="%.1f%%"),
+                    "Breakout": st.column_config.ProgressColumn(
+                        "Breakout", min_value=0, max_value=100, format="%d"),
+                    "Exit score": st.column_config.ProgressColumn(
+                        "Exit score", min_value=0, max_value=100, format="%d"),
+                },
+            )
+            ac_dl, ac_email = st.columns([1, 1])
+            ac_dl.download_button(
+                "⬇️ Download today's action plan",
+                act_df.to_csv(index=False).encode(),
+                file_name="daily_action_plan.csv", mime="text/csv",
+            )
+            _cfg = alertmod.load_config()
+            if ac_email.button("📧 Email me this plan", disabled=not alertmod.config_ready(_cfg)):
+                if not todo:
+                    lines = ["No actions today — everything is HOLD."]
+                else:
+                    lines = []
+                    for r in todo:
+                        sym = CCY_SYM.get(r["Market"], "")
+                        cash = r.get(f"Cash Δ {sym}")
+                        sd = r.get("Shares Δ")
+                        sd_str = f"{sd:+}" if isinstance(sd, (int, float)) and sd is not None else "?"
+                        lines.append(
+                            f"{r['Action']}  {r['Symbol']} ({r['Market']}): "
+                            f"{r['Adjust %']}%  {sd_str} sh @ {r['At price']} "
+                            f"→ target {r['Target today']}"
+                            + (f"  cash {sym}{cash:+}" if isinstance(cash, (int, float)) else "")
+                        )
+                body = (
+                    "Daily action plan (run ~30 min before close)\n\n"
+                    + "\n".join(lines)
+                    + "\n\nEducational info, not investment advice."
+                )
+                try:
+                    alertmod.send_email(
+                        _cfg, f"📈 Daily action plan — {len(todo)} action(s)", body)
+                    st.success("Emailed your action plan.")
+                except Exception as exc:
+                    st.error(f"Couldn't send email: {exc}")
+            if not alertmod.config_ready(_cfg):
+                st.caption("ℹ️ Set up email in the 🔔 Alerts tab to enable emailing this plan.")
+
+            st.divider()
+            st.markdown("#### 📋 Detailed exit reference (targets & stops)")
             exit_df = pd.DataFrame(exit_rows).sort_values(
                 "Exit score", ascending=False, na_position="last").reset_index(drop=True)
             st.dataframe(
