@@ -1,0 +1,109 @@
+"""Technical indicator implementations using pure pandas / numpy.
+
+These are dependency-light (no TA-Lib) so the app installs cleanly on Windows.
+All functions take a pandas Series/DataFrame of OHLCV data and return Series.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def sma(series: pd.Series, window: int) -> pd.Series:
+    return series.rolling(window).mean()
+
+
+def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    """Return (macd_line, signal_line, histogram)."""
+    macd_line = ema(close, fast) - ema(close, slow)
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+
+def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    # Wilder's smoothing
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(100)
+
+
+def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+    return tr
+
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    tr = true_range(high, low, close)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14):
+    """Return (adx, plus_di, minus_di) using Wilder's smoothing."""
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    plus_dm = pd.Series(plus_dm, index=high.index)
+    minus_dm = pd.Series(minus_dm, index=high.index)
+
+    tr = true_range(high, low, close)
+    atr_ = tr.ewm(alpha=1 / period, adjust=False).mean()
+
+    plus_di = 100 * (plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr_)
+    minus_di = 100 * (minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr_)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx_ = dx.ewm(alpha=1 / period, adjust=False).mean()
+    return adx_.fillna(0), plus_di.fillna(0), minus_di.fillna(0)
+
+
+def bollinger(close: pd.Series, window: int = 20, num_std: float = 2.0):
+    """Return (mid, upper, lower, bandwidth_pct)."""
+    mid = sma(close, window)
+    std = close.rolling(window).std()
+    upper = mid + num_std * std
+    lower = mid - num_std * std
+    bandwidth = (upper - lower) / mid * 100
+    return mid, upper, lower, bandwidth
+
+
+def bandwidth_percentile(bandwidth: pd.Series, lookback: int = 120) -> float:
+    """How tight is current Bollinger bandwidth vs recent history (0-100).
+
+    Low percentile => tight consolidation (a 'squeeze').
+    """
+    recent = bandwidth.dropna().tail(lookback)
+    if len(recent) < 10:
+        return 50.0
+    current = recent.iloc[-1]
+    return float((recent < current).mean() * 100)
+
+
+def relative_strength(close: pd.Series, bench_close: pd.Series, lookback: int = 60) -> float:
+    """Ratio-line slope of ETF vs benchmark over lookback (percent).
+
+    Positive => the ETF is outperforming its benchmark.
+    """
+    df = pd.concat([close, bench_close], axis=1).dropna()
+    if len(df) < lookback + 1:
+        lookback = max(5, len(df) - 1)
+    if len(df) < 6:
+        return 0.0
+    ratio = df.iloc[:, 0] / df.iloc[:, 1]
+    past = ratio.iloc[-lookback - 1]
+    now = ratio.iloc[-1]
+    if past == 0 or np.isnan(past):
+        return 0.0
+    return float((now / past - 1) * 100)

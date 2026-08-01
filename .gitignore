@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# Local alert state & SMTP credentials — never commit
+alerts.json
+alert_config.json

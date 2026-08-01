@@ -1,0 +1,30 @@
+{
+  "benchmark": "^NSEI",
+  "etfs": {
+    "NIFTYBEES.NS": "Nifty 50 (Broad)",
+    "JUNIORBEES.NS": "Nifty Next 50",
+    "BANKBEES.NS": "Banking",
+    "ITBEES.NS": "IT",
+    "PHARMABEES.NS": "Pharma",
+    "PSUBNKBEES.NS": "PSU Banks",
+    "AUTOBEES.NS": "Auto",
+    "FMCGIETF.NS": "FMCG",
+    "METALIETF.NS": "Metals",
+    "INFRABEES.NS": "Infrastructure",
+    "CONSUMBEES.NS": "Consumption",
+    "HEALTHIETF.NS": "Healthcare",
+    "MOM100.NS": "Midcap 100",
+    "MID150BEES.NS": "Midcap 150",
+    "MOSMALL250.NS": "Smallcap 250",
+    "CPSEETF.NS": "CPSE (PSU)",
+    "MOREALTY.NS": "Realty",
+    "MODEFENCE.NS": "Defence",
+    "HDFCAMC.NS": "HDFCAMC",
+    "NAM-INDIA.NS": "NAM-INDIA",
+    "UTIAMC.NS": "UTIAMC",
+    "ABSLAMC.NS": "ABSLAMC",
+    "ANANDRATHI.NS": "ANANDRATHI",
+    "360ONE.NS": "360ONE",
+    "Pharmabees.NS": "Pharmabees"	
+  }
+}
