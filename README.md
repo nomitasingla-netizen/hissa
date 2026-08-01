@@ -34,14 +34,38 @@ Scores are computed on **two timeframes — 4h and 1D** — and blended
 
 ## Run it
 
+The app is pure Python + Streamlit, so it runs on **Windows, macOS, and Linux**.
+You need **Python 3.9+**.
+
+**Windows (PowerShell):**
 ```powershell
-cd C:\Users\ajaysingla\sector-breakout-scanner
+cd path\to\sector-breakout-scanner
 pip install -r requirements.txt      # first time only
 python -m streamlit run app.py       # or double-click run.bat
 ```
 
+**macOS / Linux (Terminal):**
+```bash
+cd path/to/sector-breakout-scanner
+python3 -m venv .venv && source .venv/bin/activate   # optional but recommended
+pip3 install -r requirements.txt     # first time only
+python3 -m streamlit run app.py      # or: ./run.sh
+```
+
+First time on macOS/Linux, make the launchers executable:
+```bash
+chmod +x run.sh start_scanner.sh stop_scanner.sh
+./start_scanner.sh   # starts on port 8501 and opens your browser
+./stop_scanner.sh    # stops it
+```
+
 Then open http://localhost:8501, pick a market (US / India / Both), optionally
 edit the ETF lists in the sidebar, and click **Scan / Refresh**.
+
+> The "load a CSV from your Downloads folder" picker in the SIP & Exit Plan tab
+> automatically uses **your own** `~/Downloads` (or `%USERPROFILE%\Downloads` on
+> Windows). Set the `SCANNER_DOWNLOADS_DIR` environment variable to point it
+> elsewhere.
 
 ## Layout
 ```
@@ -54,7 +78,8 @@ config/
   us.json         editable US ETF/stock universe (auto-created on first run)
   india.json      editable Indian ETF/stock universe (auto-created on first run)
 app.py            Streamlit dashboard
-run.bat           double-click launcher
+run.bat / run.sh                 double-click / terminal launcher
+start_scanner.* / stop_scanner.* start & stop helpers (Windows + macOS/Linux)
 ```
 
 ## Configuring the ETF/stock universe

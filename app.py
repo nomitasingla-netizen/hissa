@@ -5,6 +5,8 @@ Run with:  streamlit run app.py
 from __future__ import annotations
 
 import math
+import os
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -1416,22 +1418,24 @@ with tab_sip:
     )
 
     up = st.file_uploader("Upload positions CSV", type=["csv"], key="pos_upload")
-    sample_paths = {
-        "— none —": None,
-        "US sample (Individual-Positions…)":
-            r"C:\Users\ajaysingla\Downloads\Individual-Positions-2026-07-25-092400.csv",
-        "India sample (holdings (1).csv)":
-            r"C:\Users\ajaysingla\Downloads\holdings (1).csv",
-    }
+
+    # Cross-platform (Windows / macOS / Linux): offer any CSV files found in the
+    # current user's Downloads folder instead of hardcoding a path.
+    downloads_dir = Path(os.environ.get("SCANNER_DOWNLOADS_DIR", Path.home() / "Downloads"))
+    sample_files = {"— none —": None}
+    if downloads_dir.is_dir():
+        for fp in sorted(downloads_dir.glob("*.csv")):
+            sample_files[fp.name] = str(fp)
     sample_choice = st.selectbox(
-        "…or load one of your Downloads files", list(sample_paths.keys()), index=0)
+        f"…or load a CSV from your Downloads folder ({downloads_dir})",
+        list(sample_files.keys()), index=0)
 
     raw_text = None
     if up is not None:
         raw_text = up.getvalue().decode("utf-8", errors="ignore")
-    elif sample_paths[sample_choice]:
+    elif sample_files.get(sample_choice):
         try:
-            with open(sample_paths[sample_choice], "r", encoding="utf-8", errors="ignore") as fh:
+            with open(sample_files[sample_choice], "r", encoding="utf-8", errors="ignore") as fh:
                 raw_text = fh.read()
         except Exception as exc:
             st.error(f"Couldn't read the file: {exc}")
