@@ -501,9 +501,9 @@ def render_table(frame):
     }
     st.dataframe(styler, use_container_width=True, hide_index=True, column_config=cfg)
 
-tab_sip, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab_alerts = st.tabs(
+tab_sip, tab1, tab2, tab3, tab_rate, tab4, tab5, tab6, tab7, tab_alerts = st.tabs(
     ["📅 SIP & Exit Plan", "🚀 Breakout Candidates", "💰 Allocation", "🔴 Exit Watch",
-     "🔎 Details", "🔁 52W-High Retest", "🆕 NSE IPOs near launch",
+     "⭐ Rate My List", "🔎 Details", "🔁 52W-High Retest", "🆕 NSE IPOs near launch",
      "🎯 Near-Zero MACD Coil", "🔔 Alerts"]
 )
 
@@ -634,6 +634,57 @@ with tab3:
         st.success("No sectors are over-extended right now. ✅")
     else:
         render_table(exit_df)
+
+with tab_rate:
+    st.subheader("⭐ Rate my list — score an uploaded file")
+    st.caption(
+        "Upload an Excel/CSV file (e.g. a TradingView screener dump or watchlist) "
+        "with a **Symbol** or **TV Code** column. Every symbol is scored with the "
+        "same screener algorithm (MACD@0, RSI, ADX, relative strength, volume, "
+        "consolidation, patterns) across the sidebar timeframe and ranked by "
+        "breakout readiness."
+    )
+
+    rate_market = st.radio(
+        "Treat symbols as", ["India", "US"], horizontal=True, key="rate_market",
+        help="India symbols are scored as NSE (.NS) against ^NSEI; US symbols "
+             "against SPY.",
+    )
+    rate_file = st.file_uploader(
+        "Upload file to rate", type=["xlsx", "xls", "csv"], key="rate_upload")
+
+    if rate_file is not None and st.button("▶️ Rate these stocks", key="rate_btn"):
+        pairs = parse_watchlist(rate_file)
+        if rate_market == "US":
+            # parse_watchlist forces a .NS suffix; strip it back for US symbols.
+            for p in pairs:
+                if p["yf"].endswith(".NS"):
+                    p["yf"] = p["yf"][:-3]
+        if not pairs:
+            st.error(
+                "Couldn't find any symbols. Expected a 'Symbol' or 'TV Code' column.")
+        else:
+            st.session_state["rate_results"] = run_list_scan(
+                pairs, rate_market, selected_tf)
+            st.session_state["rate_count"] = len(pairs)
+
+    rate_results = st.session_state.get("rate_results")
+    if rate_results:
+        st.caption(
+            f"Scored **{len(rate_results)}** of "
+            f"{st.session_state.get('rate_count', len(rate_results))} symbols "
+            "— ranked by breakout readiness. 🟢 rising fast · 🔴 falling fast · "
+            "click a **Ticker** for its TradingView chart.")
+        rdf = build_score_df(rate_results, False).sort_values(
+            "Breakout", ascending=False).reset_index(drop=True)
+        render_table(rdf)
+        st.download_button(
+            "⬇️ Download rated list CSV",
+            rdf.drop(columns=["_delta"]).to_csv(index=False).encode(),
+            file_name="rated_list.csv", mime="text/csv", key="rate_dl",
+        )
+    else:
+        st.info("Upload a file and press **Rate these stocks** to see scores.")
 
 with tab4:
     st.subheader("Per-sector breakdown")
