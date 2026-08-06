@@ -1420,6 +1420,160 @@ def daily_action(sc):
             "pct": 0, "act_price": price, "day_target": t1 or price}
 
 
+# ---- Order-history (tradebook / transactions) enrichment ------------------
+# The positions file is the source of truth for what you *hold today*; an
+# order-history export (Zerodha tradebook .xlsx/.csv or Schwab transactions
+# .csv) is layered on top to make the add/trim/exit call smarter: it tells us
+# your true average cost, how long you've held, and — crucially — whether you
+# already traded this name in the current bar, so the plan doesn't tell you to
+# keep adding to something you just bought (or re-trim what you just sold).
+
+def _orders_from_frame(frame):
+    """Normalise a tradebook/transactions frame to a list of order dicts:
+    {market, symbol, yf, side, qty, price, date}. Auto-detects the broker."""
+    frame.columns = [str(c).strip() for c in frame.columns]
+    cols = {c.lower(): c for c in frame.columns}
+    out = []
+    # Zerodha tradebook (India): Symbol, Trade Type (buy/sell), Quantity, Price.
+    if "trade type" in cols and "symbol" in cols and "quantity" in cols:
+        for _, r in frame.iterrows():
+            sym = str(r[cols["symbol"]]).strip().upper()
+            side = str(r[cols["trade type"]]).strip().lower()
+            if side not in ("buy", "sell") or not sym or sym in ("NAN", ""):
+                continue
+            date = r.get(cols.get("trade date")) or r.get(cols.get("order execution time"))
+            out.append({
+                "market": "India", "symbol": sym, "yf": f"{sym}.NS", "side": side,
+                "qty": _pos_num(r[cols["quantity"]]), "price": _pos_num(r[cols["price"]]),
+                "date": pd.to_datetime(date, errors="coerce"),
+            })
+        return out, "zerodha_tradebook"
+    # Schwab transactions (US): Date, Action (Buy/Sell…), Symbol, Quantity, Price.
+    if "action" in cols and "symbol" in cols and "quantity" in cols:
+        for _, r in frame.iterrows():
+            act = str(r[cols["action"]]).strip().lower()
+            side = "buy" if "buy" in act else "sell" if "sell" in act else None
+            sym = str(r[cols["symbol"]]).strip().upper()
+            if side is None or not sym or sym in ("NAN", ""):
+                continue
+            out.append({
+                "market": "US", "symbol": sym, "yf": sym, "side": side,
+                "qty": _pos_num(r[cols["quantity"]]), "price": _pos_num(r[cols["price"]]),
+                "date": pd.to_datetime(r.get(cols.get("date")), errors="coerce"),
+            })
+        return out, "schwab_txn"
+    return [], None
+
+
+def parse_orders_bytes(data: bytes, filename: str):
+    """Parse an uploaded order-history file (.xlsx/.xls/.csv) into order dicts.
+    Header rows are auto-located (broker exports carry title/metadata rows on
+    top). Returns (orders, fmt)."""
+    import io
+    low = filename.lower()
+    try:
+        if low.endswith((".xlsx", ".xls")):
+            raw = pd.read_excel(io.BytesIO(data), header=None)
+        else:
+            raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str,
+                              on_bad_lines="skip")
+    except Exception:
+        return [], None
+    hidx = None
+    for i in range(min(40, len(raw))):
+        vals = [str(v).strip().lower() for v in raw.iloc[i].values]
+        if "symbol" in vals and ("trade type" in vals or "action" in vals):
+            hidx = i
+            break
+    if hidx is None:
+        return [], None
+    frame = raw.iloc[hidx + 1:].copy()
+    frame.columns = list(raw.iloc[hidx].values)
+    frame = frame.dropna(how="all")
+    return _orders_from_frame(frame)
+
+
+def summarize_orders(orders: list) -> dict:
+    """Aggregate a flat order list into per-holding stats, keyed by
+    'MARKET:SYMBOL'. Returns {net_qty, buy_qty, sell_qty, avg_buy, first_buy,
+    last_date, last_side, n_trades}."""
+    from collections import defaultdict
+    agg = defaultdict(lambda: {
+        "buy_qty": 0.0, "sell_qty": 0.0, "cost": 0.0,
+        "first_buy": None, "last_date": None, "last_side": None, "n_trades": 0})
+    for o in orders:
+        key = f"{o['market']}:{o['symbol']}"
+        a = agg[key]
+        a["n_trades"] += 1
+        q = o["qty"] or 0
+        if o["side"] == "buy":
+            a["buy_qty"] += q
+            a["cost"] += q * (o["price"] or 0)
+            d = o["date"]
+            if pd.notna(d) and (a["first_buy"] is None or d < a["first_buy"]):
+                a["first_buy"] = d
+        else:
+            a["sell_qty"] += q
+        d = o["date"]
+        if pd.notna(d) and (a["last_date"] is None or d >= a["last_date"]):
+            a["last_date"] = d
+            a["last_side"] = o["side"]
+    out = {}
+    for key, a in agg.items():
+        out[key] = {
+            "net_qty": a["buy_qty"] - a["sell_qty"],
+            "buy_qty": a["buy_qty"], "sell_qty": a["sell_qty"],
+            "avg_buy": (a["cost"] / a["buy_qty"]) if a["buy_qty"] else None,
+            "first_buy": a["first_buy"], "last_date": a["last_date"],
+            "last_side": a["last_side"], "n_trades": a["n_trades"],
+        }
+    return out
+
+
+def _bar_window_days(timeframes) -> int:
+    """How many calendar days count as 'within the current bar' for the chosen
+    cadence — used to detect a trade you already made this bar."""
+    return {"4h": 1, "1d": 1, "1wk": 7}.get(_primary_tf(timeframes), 1)
+
+
+def apply_order_history(act: dict, hist: dict, timeframes) -> tuple:
+    """Refine a daily_action() result using this holding's order history.
+    Returns (act, note). Guards against over-trading within the current bar:
+    a recent BUY downgrades an ADD to HOLD; a recent SELL downgrades a (mild)
+    TRIM to HOLD. A genuine EXIT (over-extended) is always allowed through."""
+    if not hist:
+        return act, ""
+    import datetime as _d
+    note_bits = []
+    last = hist.get("last_date")
+    days_since = None
+    if last is not None and pd.notna(last):
+        days_since = (pd.Timestamp.now(tz=None).normalize()
+                      - pd.Timestamp(last).normalize()).days
+    win = _bar_window_days(timeframes)
+    recent = days_since is not None and days_since <= win
+    if recent and hist.get("last_side") == "buy" and act["side"] == "add":
+        act = dict(act, side="hold", label="✋ HOLD — added recently", pct=0)
+        note_bits.append(f"bought {days_since}d ago — skip adding again")
+    elif recent and hist.get("last_side") == "sell" and act["side"] == "trim":
+        act = dict(act, side="hold", label="✋ HOLD — trimmed recently", pct=0)
+        note_bits.append(f"sold {days_since}d ago — skip trimming again")
+    elif recent and hist.get("last_side") == "sell" and act["side"] == "exit":
+        note_bits.append(f"sold {days_since}d ago — but over-extended, exit stands")
+    elif hist.get("last_side"):
+        note_bits.append(f"last {hist['last_side']} {days_since}d ago"
+                         if days_since is not None else f"last {hist['last_side']}")
+    return act, "; ".join(note_bits)
+
+
+def _days_held(hist) -> int:
+    """Calendar days since the first recorded buy (holding age)."""
+    if not hist or hist.get("first_buy") is None or pd.isna(hist.get("first_buy")):
+        return None
+    return (pd.Timestamp.now(tz=None).normalize()
+            - pd.Timestamp(hist["first_buy"]).normalize()).days
+
+
 with tab_sip:
     st.subheader("📅 SIP & Exit Plan — weekly-primary rotation (~5%/month)")
     st.caption(
@@ -1590,6 +1744,24 @@ with tab_sip:
         f"…or load a CSV from your Downloads folder ({downloads_dir})",
         list(sample_files.keys()), index=0)
 
+    # ---- Optional order history (tradebook / transactions) ----
+    st.markdown("**➕ Order history (optional)** — refines add/trim/exit calls")
+    st.caption(
+        "Add your **Zerodha tradebook** (India, `.xlsx`/`.csv`) and/or **Schwab "
+        "transactions** (US, `.csv`). Used for true average cost, holding age, and "
+        "to avoid telling you to re-add / re-trim a name you already traded this bar."
+    )
+    order_ups = st.file_uploader(
+        "Upload order history (tradebook / transactions)",
+        type=["csv", "xlsx", "xls"], accept_multiple_files=True, key="orders_upload")
+    hist_pick_files = {}
+    if downloads_dir.is_dir():
+        for fp in sorted(list(downloads_dir.glob("*.csv")) + list(downloads_dir.glob("*.xlsx"))):
+            hist_pick_files[fp.name] = str(fp)
+    hist_picks = st.multiselect(
+        "…or pick order-history files from Downloads",
+        list(hist_pick_files.keys()), key="orders_pick")
+
     raw_text = None
     if up is not None:
         raw_text = up.getvalue().decode("utf-8", errors="ignore")
@@ -1603,6 +1775,35 @@ with tab_sip:
     if not raw_text:
         st.info("👆 Upload a positions CSV (or pick a Downloads sample) to see an exit plan.")
     else:
+        # ---- Build order-history summary (optional enrichment layer) ----
+        orders_all = []
+        order_srcs = []
+        for f in (order_ups or []):
+            try:
+                o, ofmt = parse_orders_bytes(f.getvalue(), f.name)
+            except Exception:
+                o, ofmt = [], None
+            if o:
+                orders_all += o
+                order_srcs.append(f"{f.name} ({ofmt}, {len(o)})")
+        for nm in (hist_picks or []):
+            path = hist_pick_files.get(nm)
+            if not path:
+                continue
+            try:
+                with open(path, "rb") as fh:
+                    o, ofmt = parse_orders_bytes(fh.read(), nm)
+            except Exception:
+                o, ofmt = [], None
+            if o:
+                orders_all += o
+                order_srcs.append(f"{nm} ({ofmt}, {len(o)})")
+        orders_summary = summarize_orders(orders_all) if orders_all else {}
+        if orders_summary:
+            st.caption(
+                f"📗 Order history loaded: {len(orders_all)} trades across "
+                f"{len(orders_summary)} symbols — {', '.join(order_srcs)}.")
+
         positions, fmt = parse_positions_text(raw_text)
         if not positions:
             st.error(
@@ -1641,6 +1842,11 @@ with tab_sip:
 
                     # ---- Daily two-sided action (add / trim / exit / hold) ----
                     act = daily_action(sc)
+                    hist = orders_summary.get(f"{p['market']}:{p['symbol']}")
+                    act, hist_note = apply_order_history(act, hist, selected_tf)
+                    held_days = _days_held(hist)
+                    hist_avg = hist.get("avg_buy") if hist else None
+                    n_trades = hist.get("n_trades") if hist else None
                     a_price = act["act_price"] or price
                     shares = int(round(qty * act["pct"] / 100)) if qty else None
                     if act["side"] == "add":
@@ -1663,6 +1869,9 @@ with tab_sip:
                         "At price": a_price,
                         "Bar target": act["day_target"],
                         f"Cash Δ {sym}": cash_delta,
+                        "Held days": held_days,
+                        "Trades": n_trades,
+                        "History note": hist_note or None,
                         "Breakout": sc.get("breakout"),
                         "Exit score": sc.get("exit_score"),
                         "RSI": sc.get("rsi"),
@@ -1674,6 +1883,8 @@ with tab_sip:
                         "Market": p["market"],
                         "Qty": qty,
                         "Avg cost": p.get("avg"),
+                        "Book avg (hist)": round(hist_avg, 2) if hist_avg else None,
+                        "Held days": held_days,
                         "Gain %": p.get("gain_pct"),
                         "Exit score": sc["exit_score"],
                         "RSI": sc.get("rsi"),
@@ -1719,6 +1930,10 @@ with tab_sip:
                 "to add (buy a ~1% dip) or trim (sell at price). **Bar target** = the "
                 f"level you're playing for over this {_tf_lbl} bar. **Cash Δ** is "
                 "negative when you deploy cash, positive when you free it."
+                + (" **Held days / Trades / History note** come from your order "
+                   "history — a repeat ADD (just bought) or repeat TRIM (just sold) "
+                   "is held back to HOLD this bar; a true over-extended EXIT still "
+                   "comes through." if orders_summary else "")
             )
             st.dataframe(
                 act_df, use_container_width=True, hide_index=True,

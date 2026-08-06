@@ -29,6 +29,9 @@
     "Googl": "Google",
     "MSFT": "Microsoft",
     "CSCO": "Cisco",
-    "INTC": "INtel"
+    "INTC": "INtel",
+    "NVDA": "NVDIA",
+    "AMZN": "Amazon",
+    "META": "Meta"
   }
 }
