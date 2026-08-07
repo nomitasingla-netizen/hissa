@@ -223,6 +223,13 @@ invest_amount = st.sidebar.number_input(
 )
 top_n = st.sidebar.slider("Split across top N candidates", 2, 3, 3)
 min_breakout = st.sidebar.slider("Min breakout score to qualify", 40, 80, 55)
+breakout_patience = st.sidebar.slider(
+    "Trim if no breakout within N days", 5, 120, 30,
+    help="For holdings that are still coiling below their breakout trigger: if "
+         "the breakout hasn't fired within this many days of holding (or of the "
+         "consolidation), the exit plan flags the position as stale and suggests "
+         "a light trim to free up dead money.",
+)
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
@@ -323,16 +330,15 @@ if backtest and as_of_date:
         "validate the signal. Uncheck the sidebar option for live scores."
     )
 
-if run or "results" not in st.session_state:
-    if run:
-        st.session_state["results"] = run_scan(selected_markets, custom_lists, selected_tf, as_of_date)
-    elif "results" not in st.session_state:
-        st.info("👈 Configure your markets/ETFs and click **Scan / Refresh** to begin.")
-        st.stop()
+if run:
+    st.session_state["results"] = run_scan(selected_markets, custom_lists, selected_tf, as_of_date)
 
 results = st.session_state.get("results", [])
-if not results:
-    st.stop()
+scan_ready = bool(results)
+# Note: we no longer st.stop() here when there is no scan yet — the Exit-plan
+# tab is designed to work standalone (it scores only your uploaded holdings).
+# The scanner-dependent tabs are gated later with `if not scan_ready: st.stop()`
+# rendered *after* the Exit-plan tab, so that tab always works without a scan.
 
 
 # ----------------------------- Build table -----------------------------
@@ -501,11 +507,797 @@ def render_table(frame):
     }
     st.dataframe(styler, use_container_width=True, hide_index=True, column_config=cfg)
 
-tab_sip, tab1, tab2, tab3, tab_rate, tab4, tab5, tab6, tab7, tab_alerts = st.tabs(
-    ["📅 SIP & Exit Plan", "🚀 Breakout Candidates", "💰 Allocation", "🔴 Exit Watch",
-     "⭐ Rate My List", "🔎 Details", "🔁 52W-High Retest", "🆕 NSE IPOs near launch",
+
+# ------------------- SIP & Exit Plan (tab8) --------------------------
+# A weekly-primary rotation helper aimed at ~5%/month: accumulate (SIP) into
+# the top-3 coiling leaders of the selected market, and scale out of held
+# positions (uploaded CSV) as they get over-extended.
+CCY_SYM = {"US": "$", "India": "₹"}
+
+# Dip-buying ladder: (price offset from today's close, share of the daily chunk).
+# More capital is queued at lower prices so a falling ETF lowers your average
+# cost. Shares sum to 1.0; the blended fill price is ~2% below market.
+SIP_LADDER = [(0.00, 0.40), (-0.02, 0.30), (-0.04, 0.20), (-0.06, 0.10)]
+
+
+def _pos_num(x):
+    """Parse a messy CSV cell ('$119.37', '1,234', '-5.08%', '--') to float."""
+    if x is None:
+        return None
+    s = str(x).replace("$", "").replace(",", "").replace("%", "").strip()
+    if s in ("", "--", "N/A", "nan"):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def parse_positions_text(text: str):
+    """Auto-detect a Schwab (US) or Zerodha (India) positions CSV and normalise
+    it to a list of dicts: {market, yf, symbol, qty, avg, ltp, gain_pct}."""
+    import io
+    lines = text.splitlines()
+    header_idx, fmt = None, None
+    for i, ln in enumerate(lines):
+        low = ln.lower()
+        if "symbol" in low and "asset type" in low:
+            header_idx, fmt = i, "us"
+            break
+        if "instrument" in low and "ltp" in low:
+            header_idx, fmt = i, "india"
+            break
+    if fmt is None:
+        return [], None
+    try:
+        df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
+    except Exception:
+        return [], None
+    df.columns = [str(c).strip() for c in df.columns]
+    out = []
+    if fmt == "us":
+        for _, r in df.iterrows():
+            sym = str(r.get("Symbol", "")).strip()
+            atype = str(r.get("Asset Type", "")).strip().lower()
+            if not sym or sym.lower() in ("cash & cash investments", "positions total"):
+                continue
+            if "cash" in atype or "money market" in atype:
+                continue
+            qty = _pos_num(r.get("Qty (Quantity)", r.get("Qty")))
+            if qty is None:
+                continue
+            out.append({
+                "market": "US", "yf": sym.upper(), "symbol": sym.upper(),
+                "qty": qty, "avg": _pos_num(r.get("Cost/Share")),
+                "ltp": _pos_num(r.get("Price")),
+                "gain_pct": _pos_num(r.get("Gain % (Gain/Loss %)", r.get("Gain %"))),
+            })
+    else:
+        for _, r in df.iterrows():
+            sym = str(r.get("Instrument", "")).strip()
+            if not sym or sym.lower() == "instrument":
+                continue
+            qty = _pos_num(r.get("Qty.", r.get("Qty")))
+            out.append({
+                "market": "India", "yf": f"{sym.upper()}.NS", "symbol": sym.upper(),
+                "qty": qty, "avg": _pos_num(r.get("Avg. cost")),
+                "ltp": _pos_num(r.get("LTP")),
+                "gain_pct": _pos_num(r.get("Net chg.")),
+            })
+    return out, fmt
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def score_holding_cached(ticker: str, market: str, timeframes: tuple):
+    """Score any held ticker (stock or ETF) and return the fields the exit plan
+    needs. Cached 15 min. Returns a plain dict (picklable)."""
+    bench = load_frames(MARKETS[market]["benchmark"])
+    frames = load_frames(ticker)
+    s = score_sector(ticker, ticker, frames, bench, timeframes)
+    return {
+        "exit_score": s.exit_score,
+        "breakout": s.breakout_score,
+        "signal": s.signal,
+        "price": (s.targets or {}).get("entry"),
+        "target1": (s.targets or {}).get("target1"),
+        "target1_pct": (s.targets or {}).get("target1_pct"),
+        "scale_out_pct": (s.targets or {}).get("scale_out_pct"),
+        "target": (s.targets or {}).get("target"),
+        "stop": (s.targets or {}).get("stop"),
+        "breakout_level": (s.targets or {}).get("breakout_level"),
+        "cons_days": (s.consolidation or {}).get("days"),
+        "rsi": s.tf["1d"].raw.get("rsi") if s.tf["1d"].ok else None,
+    }
+
+
+def exit_tier(exit_score):
+    """Map an exit score to a scale-out % and label."""
+    if exit_score is None:
+        return 0, "❔ No data"
+    if exit_score >= 65:
+        return 100, "🔴 Exit fully — over-extended"
+    if exit_score >= 50:
+        return 50, "🟠 Trim half — getting extended"
+    if exit_score >= 40:
+        return 25, "🟡 Trim a quarter — watch"
+    return 0, "🟢 Hold — trend intact"
+
+
+# Local exchange trading hours: tz name, (open h, m), (close h, m).
+MARKET_HOURS = {
+    "US": ("America/New_York", (9, 30), (16, 0)),
+    "India": ("Asia/Kolkata", (9, 15), (15, 30)),
+}
+ACTION_WINDOW_MIN = 30  # act within this many minutes of a bar close
+
+
+def _primary_tf(timeframes) -> str:
+    """The highest (longest) timeframe drives the action cadence."""
+    for tf in ("1wk", "1d", "4h"):
+        if tf in timeframes:
+            return tf
+    return "1d"
+
+
+def bar_close_status(market, timeframes):
+    """(message, in_window) describing when to act, based on the selected
+    timeframe's bar cadence at this market rather than a fixed daily close.
+
+    * 4h  → next 4-hour bar close within the session
+    * 1d  → the daily close
+    * 1wk → the weekly close (Friday)
+    """
+    tf = _primary_tf(timeframes)
+    label = {"4h": "4-hour", "1d": "daily", "1wk": "weekly"}[tf]
+    spec = MARKET_HOURS.get(market)
+    if not spec:
+        return (f"{market} ({label} bar): schedule unknown", False)
+    tzname, (oh, om), (ch, cm) = spec
+    try:
+        from zoneinfo import ZoneInfo
+        import datetime as _d
+        now = _d.datetime.now(ZoneInfo(tzname))
+    except Exception:
+        return (f"{market} ({label} bar): timezone unavailable", False)
+
+    dow = now.weekday()  # 0=Mon … 6=Sun
+    if dow >= 5:
+        return (f"{market} ({label} bar): market closed (weekend)", False)
+
+    close_today = now.replace(hour=ch, minute=cm, second=0, microsecond=0)
+    open_today = now.replace(hour=oh, minute=om, second=0, microsecond=0)
+
+    if tf == "1wk":
+        if dow < 4:  # Mon–Thu
+            days = 4 - dow
+            return (f"{market} (weekly bar): act Friday near close (~{days}d away)", False)
+        mins = int((close_today - now).total_seconds() // 60)  # Friday
+        if mins < 0:
+            return (f"{market} (weekly bar): Friday session closed", False)
+        return (f"{market} (weekly bar): {mins} min to Friday close",
+                mins <= ACTION_WINDOW_MIN)
+
+    # Build today's bar-close times for 4h / 1d.
+    if tf == "4h":
+        closes, t = [], open_today
+        while t < close_today:
+            t = t + _d.timedelta(hours=4)
+            closes.append(min(t, close_today))
+        closes = sorted(set(closes))
+    else:  # 1d
+        closes = [close_today]
+
+    upcoming = [c for c in closes if (c - now).total_seconds() > -60]
+    if not upcoming:
+        return (f"{market} ({label} bar): closed for today", False)
+    mins = int((upcoming[0] - now).total_seconds() // 60)
+    return (f"{market} ({label} bar): {mins} min to next bar close",
+            mins <= ACTION_WINDOW_MIN)
+
+
+def daily_action(sc):
+    """End-of-day two-sided decision for one holding.
+
+    Returns dict(side, label, pct, act_price, day_target) where side is one of
+    add / trim / exit / hold. ADD when the setup is still building (strong
+    breakout, low exit) and price is above its stop but below the first target;
+    TRIM at the first target or a rising exit score; EXIT when over-extended.
+    """
+    b = sc.get("breakout") or 0
+    e = sc.get("exit_score") or 0
+    rsi = sc.get("rsi") or 0
+    price = sc.get("price")
+    t1 = sc.get("target1")
+    t2 = sc.get("target")
+    stop = sc.get("stop")
+
+    if e >= 65 or rsi >= 80 or (t2 and price and price >= t2):
+        return {"side": "exit", "label": "🔴 EXIT — over-extended",
+                "pct": 100, "act_price": price, "day_target": t2 or price}
+    if e >= 50 or (t1 and price and price >= t1):
+        return {"side": "trim", "label": "🟠 TRIM — book partial",
+                "pct": 40, "act_price": price, "day_target": t1 or price}
+    if e >= 40:
+        return {"side": "trim", "label": "🟡 TRIM light — watch",
+                "pct": 25, "act_price": price, "day_target": t1 or price}
+    if b >= 58 and e < 45 and price and stop and price > stop and (not t1 or price < t1):
+        add_pct = 30 if b >= 70 else 20 if b >= 64 else 10
+        return {"side": "add", "label": "🟢 ADD — accumulate",
+                "pct": add_pct, "act_price": round(price * 0.99, 2),
+                "day_target": t1 or price}
+    return {"side": "hold", "label": "⚪ HOLD — do nothing",
+            "pct": 0, "act_price": price, "day_target": t1 or price}
+
+
+def breakout_watch(sc, days_waited, patience_days):
+    """Track whether a held setup has actually broken out yet, and flag it as
+    stale if the breakout hasn't fired within `patience_days`.
+
+    Returns dict(trigger, status, stale, waited, to_trigger_pct):
+      * trigger        — the price that must be crossed for a breakout
+      * to_trigger_pct — how far (%) price still is from that trigger
+      * stale          — True when it's still coiling below the trigger past the
+                         patience window (dead money → consider trimming/exiting)
+    """
+    price = sc.get("price")
+    trig = sc.get("breakout_level")
+    if not trig or not price:
+        return {"trigger": trig, "status": "—", "stale": False,
+                "waited": days_waited, "to_trigger_pct": None}
+    if price >= trig:
+        return {"trigger": trig, "status": "✅ broken out", "stale": False,
+                "waited": days_waited, "to_trigger_pct": 0.0}
+    to_pct = round((trig / price - 1) * 100, 1)
+    w = days_waited
+    if w is not None and patience_days and w >= patience_days:
+        return {"trigger": trig, "status": f"⌛ stale {w}d — no breakout",
+                "stale": True, "waited": w, "to_trigger_pct": to_pct}
+    wtxt = f"{w}/{patience_days}d" if (w is not None and patience_days) else "coiling"
+    return {"trigger": trig, "status": f"⏳ {wtxt} · +{to_pct}% to trigger",
+            "stale": False, "waited": w, "to_trigger_pct": to_pct}
+
+
+# ---- Order-history (tradebook / transactions) enrichment ------------------
+# The positions file is the source of truth for what you *hold today*; an
+# order-history export (Zerodha tradebook .xlsx/.csv or Schwab transactions
+# .csv) is layered on top to make the add/trim/exit call smarter: it tells us
+# your true average cost, how long you've held, and — crucially — whether you
+# already traded this name in the current bar, so the plan doesn't tell you to
+# keep adding to something you just bought (or re-trim what you just sold).
+
+def _orders_from_frame(frame):
+    """Normalise a tradebook/transactions frame to a list of order dicts:
+    {market, symbol, yf, side, qty, price, date}. Auto-detects the broker."""
+    frame.columns = [str(c).strip() for c in frame.columns]
+    cols = {c.lower(): c for c in frame.columns}
+    out = []
+    # Zerodha tradebook (India): Symbol, Trade Type (buy/sell), Quantity, Price.
+    if "trade type" in cols and "symbol" in cols and "quantity" in cols:
+        for _, r in frame.iterrows():
+            sym = str(r[cols["symbol"]]).strip().upper()
+            side = str(r[cols["trade type"]]).strip().lower()
+            if side not in ("buy", "sell") or not sym or sym in ("NAN", ""):
+                continue
+            date = r.get(cols.get("trade date")) or r.get(cols.get("order execution time"))
+            out.append({
+                "market": "India", "symbol": sym, "yf": f"{sym}.NS", "side": side,
+                "qty": _pos_num(r[cols["quantity"]]), "price": _pos_num(r[cols["price"]]),
+                "date": pd.to_datetime(date, errors="coerce"),
+            })
+        return out, "zerodha_tradebook"
+    # Schwab transactions (US): Date, Action (Buy/Sell…), Symbol, Quantity, Price.
+    if "action" in cols and "symbol" in cols and "quantity" in cols:
+        for _, r in frame.iterrows():
+            act = str(r[cols["action"]]).strip().lower()
+            side = "buy" if "buy" in act else "sell" if "sell" in act else None
+            sym = str(r[cols["symbol"]]).strip().upper()
+            if side is None or not sym or sym in ("NAN", ""):
+                continue
+            out.append({
+                "market": "US", "symbol": sym, "yf": sym, "side": side,
+                "qty": _pos_num(r[cols["quantity"]]), "price": _pos_num(r[cols["price"]]),
+                "date": pd.to_datetime(r.get(cols.get("date")), errors="coerce"),
+            })
+        return out, "schwab_txn"
+    return [], None
+
+
+def parse_orders_bytes(data: bytes, filename: str):
+    """Parse an uploaded order-history file (.xlsx/.xls/.csv) into order dicts.
+    Header rows are auto-located (broker exports carry title/metadata rows on
+    top). Returns (orders, fmt)."""
+    import io
+    low = filename.lower()
+    try:
+        if low.endswith((".xlsx", ".xls")):
+            raw = pd.read_excel(io.BytesIO(data), header=None)
+        else:
+            raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str,
+                              on_bad_lines="skip")
+    except Exception:
+        return [], None
+    hidx = None
+    for i in range(min(40, len(raw))):
+        vals = [str(v).strip().lower() for v in raw.iloc[i].values]
+        if "symbol" in vals and ("trade type" in vals or "action" in vals):
+            hidx = i
+            break
+    if hidx is None:
+        return [], None
+    frame = raw.iloc[hidx + 1:].copy()
+    frame.columns = list(raw.iloc[hidx].values)
+    frame = frame.dropna(how="all")
+    return _orders_from_frame(frame)
+
+
+def summarize_orders(orders: list) -> dict:
+    """Aggregate a flat order list into per-holding stats, keyed by
+    'MARKET:SYMBOL'. Returns {net_qty, buy_qty, sell_qty, avg_buy, first_buy,
+    last_date, last_side, n_trades}."""
+    from collections import defaultdict
+    agg = defaultdict(lambda: {
+        "buy_qty": 0.0, "sell_qty": 0.0, "cost": 0.0, "trades": [],
+        "first_buy": None, "last_date": None, "last_side": None, "n_trades": 0})
+    for o in orders:
+        key = f"{o['market']}:{o['symbol']}"
+        a = agg[key]
+        a["n_trades"] += 1
+        q = o["qty"] or 0
+        a["trades"].append({"date": o["date"], "side": o["side"], "qty": q})
+        if o["side"] == "buy":
+            a["buy_qty"] += q
+            a["cost"] += q * (o["price"] or 0)
+            d = o["date"]
+            if pd.notna(d) and (a["first_buy"] is None or d < a["first_buy"]):
+                a["first_buy"] = d
+        else:
+            a["sell_qty"] += q
+        d = o["date"]
+        if pd.notna(d) and (a["last_date"] is None or d >= a["last_date"]):
+            a["last_date"] = d
+            a["last_side"] = o["side"]
+    out = {}
+    for key, a in agg.items():
+        out[key] = {
+            "net_qty": a["buy_qty"] - a["sell_qty"],
+            "buy_qty": a["buy_qty"], "sell_qty": a["sell_qty"],
+            "avg_buy": (a["cost"] / a["buy_qty"]) if a["buy_qty"] else None,
+            "first_buy": a["first_buy"], "last_date": a["last_date"],
+            "last_side": a["last_side"], "n_trades": a["n_trades"],
+            "trades": a["trades"],
+        }
+    return out
+
+
+def _bar_window_days(timeframes) -> int:
+    """How many calendar days count as 'within the current bar' for the chosen
+    cadence — used to detect a trade you already made this bar."""
+    return {"4h": 1, "1d": 1, "1wk": 7}.get(_primary_tf(timeframes), 1)
+
+
+def apply_order_history(act: dict, hist: dict, timeframes, pos_qty=None) -> tuple:
+    """Refine a daily_action() result using this holding's order history.
+    Returns (act, note). Guards against over-trading within the current bar,
+    but is **quantity-aware**: a recent trade only suppresses a repeat call if
+    you already traded *at least* as many shares as the tool is now suggesting.
+    A smaller prior trade lets the call stand, netted down to the remaining size.
+
+      • recent BUY  vs an ADD  → if you already added ≥ the suggested shares,
+        downgrade to HOLD; else keep ADD for the remaining shares only.
+      • recent SELL vs a TRIM  → if you already trimmed ≥ the suggested shares,
+        downgrade to HOLD; else keep TRIM for the remaining shares only.
+      • a genuine EXIT (over-extended) is always allowed through in full.
+    """
+    if not hist:
+        return act, ""
+    note_bits = []
+    last = hist.get("last_date")
+    days_since = None
+    if last is not None and pd.notna(last):
+        days_since = (pd.Timestamp.now(tz=None).normalize()
+                      - pd.Timestamp(last).normalize()).days
+    win = _bar_window_days(timeframes)
+    recent = days_since is not None and days_since <= win
+
+    # Shares traded on the guarding side *within the current bar window*.
+    def _recent_qty(side: str) -> float:
+        tot = 0.0
+        for t in (hist.get("trades") or []):
+            d = t.get("date")
+            if pd.isna(d) or t.get("side") != side:
+                continue
+            dd = (pd.Timestamp.now(tz=None).normalize()
+                  - pd.Timestamp(d).normalize()).days
+            if 0 <= dd <= win:
+                tot += (t.get("qty") or 0)
+        return tot
+
+    guard_side = {"add": "buy", "trim": "sell"}.get(act["side"])
+    if recent and guard_side and hist.get("last_side") == guard_side:
+        orig_pct = act.get("pct") or 0
+        suggested_shares = (pos_qty or 0) * orig_pct / 100.0
+        traded = _recent_qty(guard_side)
+        verb = "added" if guard_side == "buy" else "trimmed"
+        if suggested_shares <= 0 or not pos_qty:
+            # No position size to compare against — fall back to recency guard.
+            act = dict(act, side="hold",
+                       label=f"✋ HOLD — {verb} recently", pct=0)
+            note_bits.append(f"{verb} {days_since}d ago — skip repeating")
+        elif traded >= suggested_shares - 1e-9:
+            # Already traded at least as much as suggested → stand down.
+            already_pct = round(traded / pos_qty * 100)
+            act = dict(act, side="hold",
+                       label=f"✋ HOLD — already {verb} {already_pct}%", pct=0)
+            note_bits.append(
+                f"{verb} ~{already_pct}% {days_since}d ago "
+                f"(≥ suggested {round(orig_pct)}%) — enough for now")
+        else:
+            # Partial: recommend only the *remaining* size.
+            remaining = suggested_shares - traded
+            new_pct = max(1, round(remaining / pos_qty * 100))
+            already_pct = round(traded / pos_qty * 100)
+            act = dict(act, pct=new_pct)
+            note_bits.append(
+                f"already {verb} ~{already_pct}% {days_since}d ago — "
+                f"suggesting the remaining ~{new_pct}%")
+    elif recent and hist.get("last_side") == "sell" and act["side"] == "exit":
+        note_bits.append(f"sold {days_since}d ago — but over-extended, exit stands")
+    elif hist.get("last_side"):
+        note_bits.append(f"last {hist['last_side']} {days_since}d ago"
+                         if days_since is not None else f"last {hist['last_side']}")
+    return act, "; ".join(note_bits)
+
+
+def _days_held(hist) -> int:
+    """Calendar days since the first recorded buy (holding age)."""
+    if not hist or hist.get("first_buy") is None or pd.isna(hist.get("first_buy")):
+        return None
+    return (pd.Timestamp.now(tz=None).normalize()
+            - pd.Timestamp(hist["first_buy"]).normalize()).days
+
+
+
+tab_exit, tab_sip, tab1, tab2, tab3, tab_rate, tab4, tab5, tab6, tab7, tab_alerts = st.tabs(
+    ["🎯 Exit plan — your holdings", "📅 SIP & Exit Plan", "🚀 Breakout Candidates",
+     "💰 Allocation", "🔴 Exit Watch", "⭐ Rate My List", "🔎 Details",
+     "🔁 52W-High Retest", "🆕 NSE IPOs near launch",
      "🎯 Near-Zero MACD Coil", "🔔 Alerts"]
 )
+
+with tab_exit:
+    # ============ SECTION B — Exit plan for uploaded positions ============
+    st.markdown("### 🎯 Exit plan — your holdings")
+    st.info(
+        f"⏱️ **Active timeframe: {tf_choice}** — every add/trim/exit call, target, "
+        "stop and breakout level below is computed on this timeframe. Change it from "
+        "the sidebar (weekly-inclusive blends give slower, higher-timeframe signals)."
+    )
+    st.caption(
+        "Upload your positions CSV (Schwab US *Individual-Positions…* or Zerodha "
+        "India *holdings…*) and act **near each bar close of the selected timeframe** "
+        "(4h / daily / weekly — set it in the sidebar). For each holding you get a "
+        "**two-sided action** — 🟢 add more (with %) while the setup is still building, "
+        "or 🟠/🔴 trim/exit (with %) at that bar's target — plus a detailed targets & "
+        "stops reference below."
+    )
+
+    up = st.file_uploader("Upload positions CSV", type=["csv"], key="pos_upload")
+
+    # Cross-platform (Windows / macOS / Linux): offer any CSV files found in the
+    # current user's Downloads folder instead of hardcoding a path.
+    downloads_dir = Path(os.environ.get("SCANNER_DOWNLOADS_DIR", Path.home() / "Downloads"))
+    sample_files = {"— none —": None}
+    if downloads_dir.is_dir():
+        for fp in sorted(downloads_dir.glob("*.csv")):
+            sample_files[fp.name] = str(fp)
+    sample_choice = st.selectbox(
+        f"…or load a CSV from your Downloads folder ({downloads_dir})",
+        list(sample_files.keys()), index=0)
+
+    # ---- Optional order history (tradebook / transactions) ----
+    st.markdown("**➕ Order history (optional)** — refines add/trim/exit calls")
+    st.caption(
+        "Add your **Zerodha tradebook** (India, `.xlsx`/`.csv`) and/or **Schwab "
+        "transactions** (US, `.csv`). Used for true average cost, holding age, and "
+        "to avoid telling you to re-add / re-trim a name you already traded this bar."
+    )
+    order_ups = st.file_uploader(
+        "Upload order history (tradebook / transactions)",
+        type=["csv", "xlsx", "xls"], accept_multiple_files=True, key="orders_upload")
+    hist_pick_files = {}
+    if downloads_dir.is_dir():
+        for fp in sorted(list(downloads_dir.glob("*.csv")) + list(downloads_dir.glob("*.xlsx"))):
+            hist_pick_files[fp.name] = str(fp)
+    hist_picks = st.multiselect(
+        "…or pick order-history files from Downloads",
+        list(hist_pick_files.keys()), key="orders_pick")
+
+    raw_text = None
+    if up is not None:
+        raw_text = up.getvalue().decode("utf-8", errors="ignore")
+    elif sample_files.get(sample_choice):
+        try:
+            with open(sample_files[sample_choice], "r", encoding="utf-8", errors="ignore") as fh:
+                raw_text = fh.read()
+        except Exception as exc:
+            st.error(f"Couldn't read the file: {exc}")
+
+    if not raw_text:
+        st.info("👆 Upload a positions CSV (or pick a Downloads sample) to see an exit plan.")
+    else:
+        # ---- Build order-history summary (optional enrichment layer) ----
+        orders_all = []
+        order_srcs = []
+        for f in (order_ups or []):
+            try:
+                o, ofmt = parse_orders_bytes(f.getvalue(), f.name)
+            except Exception:
+                o, ofmt = [], None
+            if o:
+                orders_all += o
+                order_srcs.append(f"{f.name} ({ofmt}, {len(o)})")
+        for nm in (hist_picks or []):
+            path = hist_pick_files.get(nm)
+            if not path:
+                continue
+            try:
+                with open(path, "rb") as fh:
+                    o, ofmt = parse_orders_bytes(fh.read(), nm)
+            except Exception:
+                o, ofmt = [], None
+            if o:
+                orders_all += o
+                order_srcs.append(f"{nm} ({ofmt}, {len(o)})")
+        orders_summary = summarize_orders(orders_all) if orders_all else {}
+        if orders_summary:
+            st.caption(
+                f"📗 Order history loaded: {len(orders_all)} trades across "
+                f"{len(orders_summary)} symbols — {', '.join(order_srcs)}.")
+
+        positions, fmt = parse_positions_text(raw_text)
+        if not positions:
+            st.error(
+                "Couldn't recognise this CSV. Expected a Schwab positions export "
+                "(has 'Symbol' + 'Asset Type') or a Zerodha holdings export "
+                "(has 'Instrument' + 'LTP')."
+            )
+        else:
+            st.caption(f"Detected **{fmt.upper()}** format — {len(positions)} holdings.")
+            exit_rows = []
+            action_rows = []
+            with st.spinner("Scoring your holdings…"):
+                for p in positions:
+                    try:
+                        sc = score_holding_cached(p["yf"], p["market"], tuple(selected_tf))
+                    except Exception:
+                        sc = None
+                    if sc is None:
+                        exit_rows.append({
+                            "Ticker": tradingview_url(p["yf"]), "Symbol": p["symbol"],
+                            "Market": p["market"], "Qty": p["qty"],
+                            "Exit score": None, "Action": "❔ No data",
+                            "Exit %": None, "Sell @": p.get("ltp"),
+                        })
+                        action_rows.append({
+                            "Symbol": p["symbol"], "Market": p["market"],
+                            "Action": "❔ No data", "_side": "hold",
+                        })
+                        continue
+                    pct, label = exit_tier(sc["exit_score"])
+                    price = sc["price"] or p.get("ltp")
+                    qty = p["qty"] or 0
+                    exit_qty = int(round(qty * pct / 100)) if qty else None
+                    sym = CCY_SYM.get(p["market"], "")
+                    free_val = round(exit_qty * price, 2) if (exit_qty and price) else None
+
+                    # ---- Order history + breakout watch (feeds the decision) ----
+                    hist = orders_summary.get(f"{p['market']}:{p['symbol']}")
+                    held_days = _days_held(hist)
+                    hist_avg = hist.get("avg_buy") if hist else None
+                    n_trades = hist.get("n_trades") if hist else None
+                    # Days waited for the breakout: how long you've held it (from
+                    # order history) if known, else how long it has been coiling.
+                    days_waited = held_days if held_days is not None else sc.get("cons_days")
+                    bw = breakout_watch(sc, days_waited, breakout_patience)
+
+                    # ---- Two-sided action (add / trim / exit / hold) ----
+                    act = daily_action(sc)
+                    # Stale-breakout rule: still coiling below the trigger past the
+                    # patience window → trim dead money instead of holding/adding.
+                    if bw["stale"] and act["side"] in ("hold", "add"):
+                        act = {"side": "trim",
+                               "label": "⌛ TRIM — breakout not happening",
+                               "pct": 25, "act_price": price,
+                               "day_target": sc.get("target1")}
+                    act, hist_note = apply_order_history(act, hist, selected_tf, qty)
+                    a_price = act["act_price"] or price
+                    shares = int(round(qty * act["pct"] / 100)) if qty else None
+                    if act["side"] == "add":
+                        shares_delta = shares                       # buy more
+                        cash_delta = -round(shares * a_price, 2) if (shares and a_price) else None
+                    elif act["side"] in ("trim", "exit"):
+                        shares_delta = -shares if shares else None   # sell
+                        cash_delta = round(shares * a_price, 2) if (shares and a_price) else None
+                    else:
+                        shares_delta, cash_delta = 0, 0
+                    action_rows.append({
+                        "Ticker": tradingview_url(p["yf"]),
+                        "Symbol": p["symbol"],
+                        "Market": p["market"],
+                        "Qty held": qty,
+                        "Gain %": p.get("gain_pct"),
+                        "Action": act["label"],
+                        "Adjust %": act["pct"] if act["side"] != "hold" else 0,
+                        "Shares Δ": shares_delta,
+                        "At price": a_price,
+                        "Bar target": act["day_target"],
+                        "Breakout above": bw["trigger"],
+                        "Breakout watch": bw["status"],
+                        f"Cash Δ {sym}": cash_delta,
+                        "Held days": held_days,
+                        "Trades": n_trades,
+                        "History note": hist_note or None,
+                        "Breakout": sc.get("breakout"),
+                        "Exit score": sc.get("exit_score"),
+                        "RSI": sc.get("rsi"),
+                        "_side": act["side"],
+                    })
+                    exit_rows.append({
+                        "Ticker": tradingview_url(p["yf"]),
+                        "Symbol": p["symbol"],
+                        "Market": p["market"],
+                        "Qty": qty,
+                        "Avg cost": p.get("avg"),
+                        "Book avg (hist)": round(hist_avg, 2) if hist_avg else None,
+                        "Held days": held_days,
+                        "Gain %": p.get("gain_pct"),
+                        "Exit score": sc["exit_score"],
+                        "RSI": sc.get("rsi"),
+                        "Action": label,
+                        "Exit %": pct,
+                        "Exit qty": exit_qty,
+                        "Sell @": price,
+                        "Breakout above": bw["trigger"],
+                        "Breakout watch": bw["status"],
+                        f"Frees {sym}": free_val,
+                        "T1 (scale ~40%)": sc.get("target1"),
+                        "T1 %": sc.get("target1_pct"),
+                        "T2 (runner)": sc.get("target"),
+                        "Trail stop @": sc.get("stop"),
+                    })
+
+            # ===== Timeframe-based action plan (cadence = selected timeframe) ===
+            _tf_lbl = {"4h": "4-hour", "1d": "daily", "1wk": "weekly"}[_primary_tf(selected_tf)]
+            st.markdown(f"#### 🕒 {_tf_lbl.capitalize()} action plan — add / trim / exit")
+            markets_held = sorted({r["Market"] for r in action_rows})
+            close_bits = []
+            in_window = False
+            for mk in markets_held:
+                msg, win = bar_close_status(mk, selected_tf)
+                close_bits.append(msg)
+                in_window = in_window or win
+            if close_bits:
+                (st.success if in_window else st.info)(
+                    " · ".join(close_bits)
+                    + (f"  — ✅ you're in the last-{ACTION_WINDOW_MIN}-min action window."
+                       if in_window else
+                       f"  — act within {ACTION_WINDOW_MIN} min of the {_tf_lbl} bar close.")
+                )
+
+            act_df = pd.DataFrame(action_rows)
+            side_order = {"exit": 0, "trim": 1, "add": 2, "hold": 3}
+            act_df["_o"] = act_df["_side"].map(side_order).fillna(3)
+            act_df = act_df.sort_values("_o").drop(columns=["_o", "_side"]).reset_index(drop=True)
+            todo = [r for r in action_rows if r["_side"] in ("add", "trim", "exit")]
+            n_add = sum(1 for r in todo if r["_side"] == "add")
+            n_out = sum(1 for r in todo if r["_side"] in ("trim", "exit"))
+            st.caption(
+                f"**{len(todo)} action(s)** — 🟢 {n_add} to add, 🔴/🟠 {n_out} to "
+                f"trim/exit; the rest are HOLD. **Adjust %** = how much of the position "
+                "to add (buy a ~1% dip) or trim (sell at price). **Bar target** = the "
+                f"level you're playing for over this {_tf_lbl} bar. **Breakout "
+                "above** = the price that must be crossed to confirm the breakout; "
+                "**Breakout watch** shows ✅ once it clears, or ⏳/⌛ how long it's "
+                f"been coiling (a name still stuck after {breakout_patience}d is "
+                "flagged stale and trimmed). **Cash Δ** is "
+                "negative when you deploy cash, positive when you free it."
+                + (" **Held days / Trades / History note** come from your order "
+                   "history — a repeat ADD (just bought) or repeat TRIM (just sold) "
+                   "is held back to HOLD this bar; a true over-extended EXIT still "
+                   "comes through." if orders_summary else "")
+            )
+            st.dataframe(
+                act_df, use_container_width=True, hide_index=True,
+                column_config={
+                    "Ticker": st.column_config.LinkColumn(
+                        "Ticker", display_text=r"symbol=(.+)$"),
+                    "Adjust %": st.column_config.NumberColumn("Adjust %", format="%d%%"),
+                    "Gain %": st.column_config.NumberColumn("Gain %", format="%.1f%%"),
+                    "Breakout": st.column_config.ProgressColumn(
+                        "Breakout", min_value=0, max_value=100, format="%d"),
+                    "Exit score": st.column_config.ProgressColumn(
+                        "Exit score", min_value=0, max_value=100, format="%d"),
+                },
+            )
+            ac_dl, ac_email = st.columns([1, 1])
+            ac_dl.download_button(
+                "⬇️ Download this action plan",
+                act_df.to_csv(index=False).encode(),
+                file_name=f"{_primary_tf(selected_tf)}_action_plan.csv", mime="text/csv",
+            )
+            _cfg = alertmod.load_config()
+            if ac_email.button("📧 Email me this plan", disabled=not alertmod.config_ready(_cfg)):
+                if not todo:
+                    lines = ["No actions — everything is HOLD."]
+                else:
+                    lines = []
+                    for r in todo:
+                        sym = CCY_SYM.get(r["Market"], "")
+                        cash = r.get(f"Cash Δ {sym}")
+                        sd = r.get("Shares Δ")
+                        sd_str = f"{sd:+}" if isinstance(sd, (int, float)) and sd is not None else "?"
+                        lines.append(
+                            f"{r['Action']}  {r['Symbol']} ({r['Market']}): "
+                            f"{r['Adjust %']}%  {sd_str} sh @ {r['At price']} "
+                            f"→ target {r['Bar target']}"
+                            + (f"  |  breakout above {r.get('Breakout above')}"
+                               if r.get("Breakout above") else "")
+                            + (f"  cash {sym}{cash:+}" if isinstance(cash, (int, float)) else "")
+                        )
+                body = (
+                    f"{_tf_lbl.capitalize()} action plan "
+                    f"(act near the {_tf_lbl} bar close)\n\n"
+                    + "\n".join(lines)
+                    + "\n\nEducational info, not investment advice."
+                )
+                try:
+                    alertmod.send_email(
+                        _cfg, f"📈 {_tf_lbl.capitalize()} action plan — {len(todo)} action(s)", body)
+                    st.success("Emailed your action plan.")
+                except Exception as exc:
+                    st.error(f"Couldn't send email: {exc}")
+            if not alertmod.config_ready(_cfg):
+                st.caption("ℹ️ Set up email in the 🔔 Alerts tab to enable emailing this plan.")
+
+            st.divider()
+            st.markdown("#### 📋 Detailed exit reference (targets & stops)")
+            exit_df = pd.DataFrame(exit_rows).sort_values(
+                "Exit score", ascending=False, na_position="last").reset_index(drop=True)
+            st.dataframe(
+                exit_df, use_container_width=True, hide_index=True,
+                column_config={
+                    "Ticker": st.column_config.LinkColumn(
+                        "Ticker", display_text=r"symbol=(.+)$"),
+                    "Exit score": st.column_config.ProgressColumn(
+                        "Exit score", min_value=0, max_value=100, format="%d"),
+                    "Exit %": st.column_config.NumberColumn("Exit %", format="%d%%"),
+                    "T1 %": st.column_config.NumberColumn("T1 %", format="%.1f%%"),
+                    "Gain %": st.column_config.NumberColumn("Gain %", format="%.1f%%"),
+                },
+            )
+            st.download_button(
+                "⬇️ Download exit plan CSV",
+                exit_df.to_csv(index=False).encode(),
+                file_name="exit_plan.csv", mime="text/csv",
+            )
+            st.caption(
+                "**Exit %** scales with the exit score: ≥65 exit fully, ≥50 trim half, "
+                "≥40 trim a quarter, else hold. **Sell @** = current price (place the "
+                "scale-out limit at/above it). **Breakout above** = the price that must "
+                "cross for the breakout to trigger; **Breakout watch** flags a position "
+                f"stale (⌛) if it's still coiling below that trigger after "
+                f"{breakout_patience} days. **T1 (scale ~40%)** = first resistance — "
+                "book ~40% here to lock in a month's worth of gains; **T2 (runner)** = "
+                "full measured-move target for the remainder; **Trail stop @** = exit the "
+                "rest if it breaks below. Educational info, not investment advice."
+            )
+
+
+
+# --- Gate: scanner tabs need a scan; the Exit-plan tab above does not ---
+if not scan_ready:
+    st.stop()
+
 
 with tab1:
     st.subheader("Ranked by breakout readiness")
@@ -1201,379 +1993,6 @@ with tab7:
                 "range low / 1.5·ATR. Educational info, not investment advice."
             )
 
-# ------------------- SIP & Exit Plan (tab8) --------------------------
-# A weekly-primary rotation helper aimed at ~5%/month: accumulate (SIP) into
-# the top-3 coiling leaders of the selected market, and scale out of held
-# positions (uploaded CSV) as they get over-extended.
-CCY_SYM = {"US": "$", "India": "₹"}
-
-# Dip-buying ladder: (price offset from today's close, share of the daily chunk).
-# More capital is queued at lower prices so a falling ETF lowers your average
-# cost. Shares sum to 1.0; the blended fill price is ~2% below market.
-SIP_LADDER = [(0.00, 0.40), (-0.02, 0.30), (-0.04, 0.20), (-0.06, 0.10)]
-
-
-def _pos_num(x):
-    """Parse a messy CSV cell ('$119.37', '1,234', '-5.08%', '--') to float."""
-    if x is None:
-        return None
-    s = str(x).replace("$", "").replace(",", "").replace("%", "").strip()
-    if s in ("", "--", "N/A", "nan"):
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-
-def parse_positions_text(text: str):
-    """Auto-detect a Schwab (US) or Zerodha (India) positions CSV and normalise
-    it to a list of dicts: {market, yf, symbol, qty, avg, ltp, gain_pct}."""
-    import io
-    lines = text.splitlines()
-    header_idx, fmt = None, None
-    for i, ln in enumerate(lines):
-        low = ln.lower()
-        if "symbol" in low and "asset type" in low:
-            header_idx, fmt = i, "us"
-            break
-        if "instrument" in low and "ltp" in low:
-            header_idx, fmt = i, "india"
-            break
-    if fmt is None:
-        return [], None
-    try:
-        df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
-    except Exception:
-        return [], None
-    df.columns = [str(c).strip() for c in df.columns]
-    out = []
-    if fmt == "us":
-        for _, r in df.iterrows():
-            sym = str(r.get("Symbol", "")).strip()
-            atype = str(r.get("Asset Type", "")).strip().lower()
-            if not sym or sym.lower() in ("cash & cash investments", "positions total"):
-                continue
-            if "cash" in atype or "money market" in atype:
-                continue
-            qty = _pos_num(r.get("Qty (Quantity)", r.get("Qty")))
-            if qty is None:
-                continue
-            out.append({
-                "market": "US", "yf": sym.upper(), "symbol": sym.upper(),
-                "qty": qty, "avg": _pos_num(r.get("Cost/Share")),
-                "ltp": _pos_num(r.get("Price")),
-                "gain_pct": _pos_num(r.get("Gain % (Gain/Loss %)", r.get("Gain %"))),
-            })
-    else:
-        for _, r in df.iterrows():
-            sym = str(r.get("Instrument", "")).strip()
-            if not sym or sym.lower() == "instrument":
-                continue
-            qty = _pos_num(r.get("Qty.", r.get("Qty")))
-            out.append({
-                "market": "India", "yf": f"{sym.upper()}.NS", "symbol": sym.upper(),
-                "qty": qty, "avg": _pos_num(r.get("Avg. cost")),
-                "ltp": _pos_num(r.get("LTP")),
-                "gain_pct": _pos_num(r.get("Net chg.")),
-            })
-    return out, fmt
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def score_holding_cached(ticker: str, market: str, timeframes: tuple):
-    """Score any held ticker (stock or ETF) and return the fields the exit plan
-    needs. Cached 15 min. Returns a plain dict (picklable)."""
-    bench = load_frames(MARKETS[market]["benchmark"])
-    frames = load_frames(ticker)
-    s = score_sector(ticker, ticker, frames, bench, timeframes)
-    return {
-        "exit_score": s.exit_score,
-        "breakout": s.breakout_score,
-        "signal": s.signal,
-        "price": (s.targets or {}).get("entry"),
-        "target1": (s.targets or {}).get("target1"),
-        "target1_pct": (s.targets or {}).get("target1_pct"),
-        "scale_out_pct": (s.targets or {}).get("scale_out_pct"),
-        "target": (s.targets or {}).get("target"),
-        "stop": (s.targets or {}).get("stop"),
-        "rsi": s.tf["1d"].raw.get("rsi") if s.tf["1d"].ok else None,
-    }
-
-
-def exit_tier(exit_score):
-    """Map an exit score to a scale-out % and label."""
-    if exit_score is None:
-        return 0, "❔ No data"
-    if exit_score >= 65:
-        return 100, "🔴 Exit fully — over-extended"
-    if exit_score >= 50:
-        return 50, "🟠 Trim half — getting extended"
-    if exit_score >= 40:
-        return 25, "🟡 Trim a quarter — watch"
-    return 0, "🟢 Hold — trend intact"
-
-
-# Local exchange trading hours: tz name, (open h, m), (close h, m).
-MARKET_HOURS = {
-    "US": ("America/New_York", (9, 30), (16, 0)),
-    "India": ("Asia/Kolkata", (9, 15), (15, 30)),
-}
-ACTION_WINDOW_MIN = 30  # act within this many minutes of a bar close
-
-
-def _primary_tf(timeframes) -> str:
-    """The highest (longest) timeframe drives the action cadence."""
-    for tf in ("1wk", "1d", "4h"):
-        if tf in timeframes:
-            return tf
-    return "1d"
-
-
-def bar_close_status(market, timeframes):
-    """(message, in_window) describing when to act, based on the selected
-    timeframe's bar cadence at this market rather than a fixed daily close.
-
-    * 4h  → next 4-hour bar close within the session
-    * 1d  → the daily close
-    * 1wk → the weekly close (Friday)
-    """
-    tf = _primary_tf(timeframes)
-    label = {"4h": "4-hour", "1d": "daily", "1wk": "weekly"}[tf]
-    spec = MARKET_HOURS.get(market)
-    if not spec:
-        return (f"{market} ({label} bar): schedule unknown", False)
-    tzname, (oh, om), (ch, cm) = spec
-    try:
-        from zoneinfo import ZoneInfo
-        import datetime as _d
-        now = _d.datetime.now(ZoneInfo(tzname))
-    except Exception:
-        return (f"{market} ({label} bar): timezone unavailable", False)
-
-    dow = now.weekday()  # 0=Mon … 6=Sun
-    if dow >= 5:
-        return (f"{market} ({label} bar): market closed (weekend)", False)
-
-    close_today = now.replace(hour=ch, minute=cm, second=0, microsecond=0)
-    open_today = now.replace(hour=oh, minute=om, second=0, microsecond=0)
-
-    if tf == "1wk":
-        if dow < 4:  # Mon–Thu
-            days = 4 - dow
-            return (f"{market} (weekly bar): act Friday near close (~{days}d away)", False)
-        mins = int((close_today - now).total_seconds() // 60)  # Friday
-        if mins < 0:
-            return (f"{market} (weekly bar): Friday session closed", False)
-        return (f"{market} (weekly bar): {mins} min to Friday close",
-                mins <= ACTION_WINDOW_MIN)
-
-    # Build today's bar-close times for 4h / 1d.
-    if tf == "4h":
-        closes, t = [], open_today
-        while t < close_today:
-            t = t + _d.timedelta(hours=4)
-            closes.append(min(t, close_today))
-        closes = sorted(set(closes))
-    else:  # 1d
-        closes = [close_today]
-
-    upcoming = [c for c in closes if (c - now).total_seconds() > -60]
-    if not upcoming:
-        return (f"{market} ({label} bar): closed for today", False)
-    mins = int((upcoming[0] - now).total_seconds() // 60)
-    return (f"{market} ({label} bar): {mins} min to next bar close",
-            mins <= ACTION_WINDOW_MIN)
-
-
-def daily_action(sc):
-    """End-of-day two-sided decision for one holding.
-
-    Returns dict(side, label, pct, act_price, day_target) where side is one of
-    add / trim / exit / hold. ADD when the setup is still building (strong
-    breakout, low exit) and price is above its stop but below the first target;
-    TRIM at the first target or a rising exit score; EXIT when over-extended.
-    """
-    b = sc.get("breakout") or 0
-    e = sc.get("exit_score") or 0
-    rsi = sc.get("rsi") or 0
-    price = sc.get("price")
-    t1 = sc.get("target1")
-    t2 = sc.get("target")
-    stop = sc.get("stop")
-
-    if e >= 65 or rsi >= 80 or (t2 and price and price >= t2):
-        return {"side": "exit", "label": "🔴 EXIT — over-extended",
-                "pct": 100, "act_price": price, "day_target": t2 or price}
-    if e >= 50 or (t1 and price and price >= t1):
-        return {"side": "trim", "label": "🟠 TRIM — book partial",
-                "pct": 40, "act_price": price, "day_target": t1 or price}
-    if e >= 40:
-        return {"side": "trim", "label": "🟡 TRIM light — watch",
-                "pct": 25, "act_price": price, "day_target": t1 or price}
-    if b >= 58 and e < 45 and price and stop and price > stop and (not t1 or price < t1):
-        add_pct = 30 if b >= 70 else 20 if b >= 64 else 10
-        return {"side": "add", "label": "🟢 ADD — accumulate",
-                "pct": add_pct, "act_price": round(price * 0.99, 2),
-                "day_target": t1 or price}
-    return {"side": "hold", "label": "⚪ HOLD — do nothing",
-            "pct": 0, "act_price": price, "day_target": t1 or price}
-
-
-# ---- Order-history (tradebook / transactions) enrichment ------------------
-# The positions file is the source of truth for what you *hold today*; an
-# order-history export (Zerodha tradebook .xlsx/.csv or Schwab transactions
-# .csv) is layered on top to make the add/trim/exit call smarter: it tells us
-# your true average cost, how long you've held, and — crucially — whether you
-# already traded this name in the current bar, so the plan doesn't tell you to
-# keep adding to something you just bought (or re-trim what you just sold).
-
-def _orders_from_frame(frame):
-    """Normalise a tradebook/transactions frame to a list of order dicts:
-    {market, symbol, yf, side, qty, price, date}. Auto-detects the broker."""
-    frame.columns = [str(c).strip() for c in frame.columns]
-    cols = {c.lower(): c for c in frame.columns}
-    out = []
-    # Zerodha tradebook (India): Symbol, Trade Type (buy/sell), Quantity, Price.
-    if "trade type" in cols and "symbol" in cols and "quantity" in cols:
-        for _, r in frame.iterrows():
-            sym = str(r[cols["symbol"]]).strip().upper()
-            side = str(r[cols["trade type"]]).strip().lower()
-            if side not in ("buy", "sell") or not sym or sym in ("NAN", ""):
-                continue
-            date = r.get(cols.get("trade date")) or r.get(cols.get("order execution time"))
-            out.append({
-                "market": "India", "symbol": sym, "yf": f"{sym}.NS", "side": side,
-                "qty": _pos_num(r[cols["quantity"]]), "price": _pos_num(r[cols["price"]]),
-                "date": pd.to_datetime(date, errors="coerce"),
-            })
-        return out, "zerodha_tradebook"
-    # Schwab transactions (US): Date, Action (Buy/Sell…), Symbol, Quantity, Price.
-    if "action" in cols and "symbol" in cols and "quantity" in cols:
-        for _, r in frame.iterrows():
-            act = str(r[cols["action"]]).strip().lower()
-            side = "buy" if "buy" in act else "sell" if "sell" in act else None
-            sym = str(r[cols["symbol"]]).strip().upper()
-            if side is None or not sym or sym in ("NAN", ""):
-                continue
-            out.append({
-                "market": "US", "symbol": sym, "yf": sym, "side": side,
-                "qty": _pos_num(r[cols["quantity"]]), "price": _pos_num(r[cols["price"]]),
-                "date": pd.to_datetime(r.get(cols.get("date")), errors="coerce"),
-            })
-        return out, "schwab_txn"
-    return [], None
-
-
-def parse_orders_bytes(data: bytes, filename: str):
-    """Parse an uploaded order-history file (.xlsx/.xls/.csv) into order dicts.
-    Header rows are auto-located (broker exports carry title/metadata rows on
-    top). Returns (orders, fmt)."""
-    import io
-    low = filename.lower()
-    try:
-        if low.endswith((".xlsx", ".xls")):
-            raw = pd.read_excel(io.BytesIO(data), header=None)
-        else:
-            raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str,
-                              on_bad_lines="skip")
-    except Exception:
-        return [], None
-    hidx = None
-    for i in range(min(40, len(raw))):
-        vals = [str(v).strip().lower() for v in raw.iloc[i].values]
-        if "symbol" in vals and ("trade type" in vals or "action" in vals):
-            hidx = i
-            break
-    if hidx is None:
-        return [], None
-    frame = raw.iloc[hidx + 1:].copy()
-    frame.columns = list(raw.iloc[hidx].values)
-    frame = frame.dropna(how="all")
-    return _orders_from_frame(frame)
-
-
-def summarize_orders(orders: list) -> dict:
-    """Aggregate a flat order list into per-holding stats, keyed by
-    'MARKET:SYMBOL'. Returns {net_qty, buy_qty, sell_qty, avg_buy, first_buy,
-    last_date, last_side, n_trades}."""
-    from collections import defaultdict
-    agg = defaultdict(lambda: {
-        "buy_qty": 0.0, "sell_qty": 0.0, "cost": 0.0,
-        "first_buy": None, "last_date": None, "last_side": None, "n_trades": 0})
-    for o in orders:
-        key = f"{o['market']}:{o['symbol']}"
-        a = agg[key]
-        a["n_trades"] += 1
-        q = o["qty"] or 0
-        if o["side"] == "buy":
-            a["buy_qty"] += q
-            a["cost"] += q * (o["price"] or 0)
-            d = o["date"]
-            if pd.notna(d) and (a["first_buy"] is None or d < a["first_buy"]):
-                a["first_buy"] = d
-        else:
-            a["sell_qty"] += q
-        d = o["date"]
-        if pd.notna(d) and (a["last_date"] is None or d >= a["last_date"]):
-            a["last_date"] = d
-            a["last_side"] = o["side"]
-    out = {}
-    for key, a in agg.items():
-        out[key] = {
-            "net_qty": a["buy_qty"] - a["sell_qty"],
-            "buy_qty": a["buy_qty"], "sell_qty": a["sell_qty"],
-            "avg_buy": (a["cost"] / a["buy_qty"]) if a["buy_qty"] else None,
-            "first_buy": a["first_buy"], "last_date": a["last_date"],
-            "last_side": a["last_side"], "n_trades": a["n_trades"],
-        }
-    return out
-
-
-def _bar_window_days(timeframes) -> int:
-    """How many calendar days count as 'within the current bar' for the chosen
-    cadence — used to detect a trade you already made this bar."""
-    return {"4h": 1, "1d": 1, "1wk": 7}.get(_primary_tf(timeframes), 1)
-
-
-def apply_order_history(act: dict, hist: dict, timeframes) -> tuple:
-    """Refine a daily_action() result using this holding's order history.
-    Returns (act, note). Guards against over-trading within the current bar:
-    a recent BUY downgrades an ADD to HOLD; a recent SELL downgrades a (mild)
-    TRIM to HOLD. A genuine EXIT (over-extended) is always allowed through."""
-    if not hist:
-        return act, ""
-    import datetime as _d
-    note_bits = []
-    last = hist.get("last_date")
-    days_since = None
-    if last is not None and pd.notna(last):
-        days_since = (pd.Timestamp.now(tz=None).normalize()
-                      - pd.Timestamp(last).normalize()).days
-    win = _bar_window_days(timeframes)
-    recent = days_since is not None and days_since <= win
-    if recent and hist.get("last_side") == "buy" and act["side"] == "add":
-        act = dict(act, side="hold", label="✋ HOLD — added recently", pct=0)
-        note_bits.append(f"bought {days_since}d ago — skip adding again")
-    elif recent and hist.get("last_side") == "sell" and act["side"] == "trim":
-        act = dict(act, side="hold", label="✋ HOLD — trimmed recently", pct=0)
-        note_bits.append(f"sold {days_since}d ago — skip trimming again")
-    elif recent and hist.get("last_side") == "sell" and act["side"] == "exit":
-        note_bits.append(f"sold {days_since}d ago — but over-extended, exit stands")
-    elif hist.get("last_side"):
-        note_bits.append(f"last {hist['last_side']} {days_since}d ago"
-                         if days_since is not None else f"last {hist['last_side']}")
-    return act, "; ".join(note_bits)
-
-
-def _days_held(hist) -> int:
-    """Calendar days since the first recorded buy (holding age)."""
-    if not hist or hist.get("first_buy") is None or pd.isna(hist.get("first_buy")):
-        return None
-    return (pd.Timestamp.now(tz=None).normalize()
-            - pd.Timestamp(hist["first_buy"]).normalize()).days
-
-
 with tab_sip:
     st.subheader("📅 SIP & Exit Plan — weekly-primary rotation (~5%/month)")
     st.caption(
@@ -1717,304 +2136,6 @@ with tab_sip:
         "whole dip ladder fills (lower = safer). Skip a day if a name is already "
         "extended (see the Exit plan below or the Exit Watch tab)."
     )
-
-    st.divider()
-
-    # ============ SECTION B — Exit plan for uploaded positions ============
-    st.markdown("### 2️⃣ Exit plan — your holdings")
-    st.caption(
-        "Upload your positions CSV (Schwab US *Individual-Positions…* or Zerodha "
-        "India *holdings…*) and act **near each bar close of the selected timeframe** "
-        "(4h / daily / weekly — set it in the sidebar). For each holding you get a "
-        "**two-sided action** — 🟢 add more (with %) while the setup is still building, "
-        "or 🟠/🔴 trim/exit (with %) at that bar's target — plus a detailed targets & "
-        "stops reference below."
-    )
-
-    up = st.file_uploader("Upload positions CSV", type=["csv"], key="pos_upload")
-
-    # Cross-platform (Windows / macOS / Linux): offer any CSV files found in the
-    # current user's Downloads folder instead of hardcoding a path.
-    downloads_dir = Path(os.environ.get("SCANNER_DOWNLOADS_DIR", Path.home() / "Downloads"))
-    sample_files = {"— none —": None}
-    if downloads_dir.is_dir():
-        for fp in sorted(downloads_dir.glob("*.csv")):
-            sample_files[fp.name] = str(fp)
-    sample_choice = st.selectbox(
-        f"…or load a CSV from your Downloads folder ({downloads_dir})",
-        list(sample_files.keys()), index=0)
-
-    # ---- Optional order history (tradebook / transactions) ----
-    st.markdown("**➕ Order history (optional)** — refines add/trim/exit calls")
-    st.caption(
-        "Add your **Zerodha tradebook** (India, `.xlsx`/`.csv`) and/or **Schwab "
-        "transactions** (US, `.csv`). Used for true average cost, holding age, and "
-        "to avoid telling you to re-add / re-trim a name you already traded this bar."
-    )
-    order_ups = st.file_uploader(
-        "Upload order history (tradebook / transactions)",
-        type=["csv", "xlsx", "xls"], accept_multiple_files=True, key="orders_upload")
-    hist_pick_files = {}
-    if downloads_dir.is_dir():
-        for fp in sorted(list(downloads_dir.glob("*.csv")) + list(downloads_dir.glob("*.xlsx"))):
-            hist_pick_files[fp.name] = str(fp)
-    hist_picks = st.multiselect(
-        "…or pick order-history files from Downloads",
-        list(hist_pick_files.keys()), key="orders_pick")
-
-    raw_text = None
-    if up is not None:
-        raw_text = up.getvalue().decode("utf-8", errors="ignore")
-    elif sample_files.get(sample_choice):
-        try:
-            with open(sample_files[sample_choice], "r", encoding="utf-8", errors="ignore") as fh:
-                raw_text = fh.read()
-        except Exception as exc:
-            st.error(f"Couldn't read the file: {exc}")
-
-    if not raw_text:
-        st.info("👆 Upload a positions CSV (or pick a Downloads sample) to see an exit plan.")
-    else:
-        # ---- Build order-history summary (optional enrichment layer) ----
-        orders_all = []
-        order_srcs = []
-        for f in (order_ups or []):
-            try:
-                o, ofmt = parse_orders_bytes(f.getvalue(), f.name)
-            except Exception:
-                o, ofmt = [], None
-            if o:
-                orders_all += o
-                order_srcs.append(f"{f.name} ({ofmt}, {len(o)})")
-        for nm in (hist_picks or []):
-            path = hist_pick_files.get(nm)
-            if not path:
-                continue
-            try:
-                with open(path, "rb") as fh:
-                    o, ofmt = parse_orders_bytes(fh.read(), nm)
-            except Exception:
-                o, ofmt = [], None
-            if o:
-                orders_all += o
-                order_srcs.append(f"{nm} ({ofmt}, {len(o)})")
-        orders_summary = summarize_orders(orders_all) if orders_all else {}
-        if orders_summary:
-            st.caption(
-                f"📗 Order history loaded: {len(orders_all)} trades across "
-                f"{len(orders_summary)} symbols — {', '.join(order_srcs)}.")
-
-        positions, fmt = parse_positions_text(raw_text)
-        if not positions:
-            st.error(
-                "Couldn't recognise this CSV. Expected a Schwab positions export "
-                "(has 'Symbol' + 'Asset Type') or a Zerodha holdings export "
-                "(has 'Instrument' + 'LTP')."
-            )
-        else:
-            st.caption(f"Detected **{fmt.upper()}** format — {len(positions)} holdings.")
-            exit_rows = []
-            action_rows = []
-            with st.spinner("Scoring your holdings…"):
-                for p in positions:
-                    try:
-                        sc = score_holding_cached(p["yf"], p["market"], tuple(selected_tf))
-                    except Exception:
-                        sc = None
-                    if sc is None:
-                        exit_rows.append({
-                            "Ticker": tradingview_url(p["yf"]), "Symbol": p["symbol"],
-                            "Market": p["market"], "Qty": p["qty"],
-                            "Exit score": None, "Action": "❔ No data",
-                            "Exit %": None, "Sell @": p.get("ltp"),
-                        })
-                        action_rows.append({
-                            "Symbol": p["symbol"], "Market": p["market"],
-                            "Action": "❔ No data", "_side": "hold",
-                        })
-                        continue
-                    pct, label = exit_tier(sc["exit_score"])
-                    price = sc["price"] or p.get("ltp")
-                    qty = p["qty"] or 0
-                    exit_qty = int(round(qty * pct / 100)) if qty else None
-                    sym = CCY_SYM.get(p["market"], "")
-                    free_val = round(exit_qty * price, 2) if (exit_qty and price) else None
-
-                    # ---- Daily two-sided action (add / trim / exit / hold) ----
-                    act = daily_action(sc)
-                    hist = orders_summary.get(f"{p['market']}:{p['symbol']}")
-                    act, hist_note = apply_order_history(act, hist, selected_tf)
-                    held_days = _days_held(hist)
-                    hist_avg = hist.get("avg_buy") if hist else None
-                    n_trades = hist.get("n_trades") if hist else None
-                    a_price = act["act_price"] or price
-                    shares = int(round(qty * act["pct"] / 100)) if qty else None
-                    if act["side"] == "add":
-                        shares_delta = shares                       # buy more
-                        cash_delta = -round(shares * a_price, 2) if (shares and a_price) else None
-                    elif act["side"] in ("trim", "exit"):
-                        shares_delta = -shares if shares else None   # sell
-                        cash_delta = round(shares * a_price, 2) if (shares and a_price) else None
-                    else:
-                        shares_delta, cash_delta = 0, 0
-                    action_rows.append({
-                        "Ticker": tradingview_url(p["yf"]),
-                        "Symbol": p["symbol"],
-                        "Market": p["market"],
-                        "Qty held": qty,
-                        "Gain %": p.get("gain_pct"),
-                        "Action": act["label"],
-                        "Adjust %": act["pct"] if act["side"] != "hold" else 0,
-                        "Shares Δ": shares_delta,
-                        "At price": a_price,
-                        "Bar target": act["day_target"],
-                        f"Cash Δ {sym}": cash_delta,
-                        "Held days": held_days,
-                        "Trades": n_trades,
-                        "History note": hist_note or None,
-                        "Breakout": sc.get("breakout"),
-                        "Exit score": sc.get("exit_score"),
-                        "RSI": sc.get("rsi"),
-                        "_side": act["side"],
-                    })
-                    exit_rows.append({
-                        "Ticker": tradingview_url(p["yf"]),
-                        "Symbol": p["symbol"],
-                        "Market": p["market"],
-                        "Qty": qty,
-                        "Avg cost": p.get("avg"),
-                        "Book avg (hist)": round(hist_avg, 2) if hist_avg else None,
-                        "Held days": held_days,
-                        "Gain %": p.get("gain_pct"),
-                        "Exit score": sc["exit_score"],
-                        "RSI": sc.get("rsi"),
-                        "Action": label,
-                        "Exit %": pct,
-                        "Exit qty": exit_qty,
-                        "Sell @": price,
-                        f"Frees {sym}": free_val,
-                        "T1 (scale ~40%)": sc.get("target1"),
-                        "T1 %": sc.get("target1_pct"),
-                        "T2 (runner)": sc.get("target"),
-                        "Trail stop @": sc.get("stop"),
-                    })
-
-            # ===== Timeframe-based action plan (cadence = selected timeframe) ===
-            _tf_lbl = {"4h": "4-hour", "1d": "daily", "1wk": "weekly"}[_primary_tf(selected_tf)]
-            st.markdown(f"#### 🕒 {_tf_lbl.capitalize()} action plan — add / trim / exit")
-            markets_held = sorted({r["Market"] for r in action_rows})
-            close_bits = []
-            in_window = False
-            for mk in markets_held:
-                msg, win = bar_close_status(mk, selected_tf)
-                close_bits.append(msg)
-                in_window = in_window or win
-            if close_bits:
-                (st.success if in_window else st.info)(
-                    " · ".join(close_bits)
-                    + (f"  — ✅ you're in the last-{ACTION_WINDOW_MIN}-min action window."
-                       if in_window else
-                       f"  — act within {ACTION_WINDOW_MIN} min of the {_tf_lbl} bar close.")
-                )
-
-            act_df = pd.DataFrame(action_rows)
-            side_order = {"exit": 0, "trim": 1, "add": 2, "hold": 3}
-            act_df["_o"] = act_df["_side"].map(side_order).fillna(3)
-            act_df = act_df.sort_values("_o").drop(columns=["_o", "_side"]).reset_index(drop=True)
-            todo = [r for r in action_rows if r["_side"] in ("add", "trim", "exit")]
-            n_add = sum(1 for r in todo if r["_side"] == "add")
-            n_out = sum(1 for r in todo if r["_side"] in ("trim", "exit"))
-            st.caption(
-                f"**{len(todo)} action(s)** — 🟢 {n_add} to add, 🔴/🟠 {n_out} to "
-                f"trim/exit; the rest are HOLD. **Adjust %** = how much of the position "
-                "to add (buy a ~1% dip) or trim (sell at price). **Bar target** = the "
-                f"level you're playing for over this {_tf_lbl} bar. **Cash Δ** is "
-                "negative when you deploy cash, positive when you free it."
-                + (" **Held days / Trades / History note** come from your order "
-                   "history — a repeat ADD (just bought) or repeat TRIM (just sold) "
-                   "is held back to HOLD this bar; a true over-extended EXIT still "
-                   "comes through." if orders_summary else "")
-            )
-            st.dataframe(
-                act_df, use_container_width=True, hide_index=True,
-                column_config={
-                    "Ticker": st.column_config.LinkColumn(
-                        "Ticker", display_text=r"symbol=(.+)$"),
-                    "Adjust %": st.column_config.NumberColumn("Adjust %", format="%d%%"),
-                    "Gain %": st.column_config.NumberColumn("Gain %", format="%.1f%%"),
-                    "Breakout": st.column_config.ProgressColumn(
-                        "Breakout", min_value=0, max_value=100, format="%d"),
-                    "Exit score": st.column_config.ProgressColumn(
-                        "Exit score", min_value=0, max_value=100, format="%d"),
-                },
-            )
-            ac_dl, ac_email = st.columns([1, 1])
-            ac_dl.download_button(
-                "⬇️ Download this action plan",
-                act_df.to_csv(index=False).encode(),
-                file_name=f"{_primary_tf(selected_tf)}_action_plan.csv", mime="text/csv",
-            )
-            _cfg = alertmod.load_config()
-            if ac_email.button("📧 Email me this plan", disabled=not alertmod.config_ready(_cfg)):
-                if not todo:
-                    lines = ["No actions — everything is HOLD."]
-                else:
-                    lines = []
-                    for r in todo:
-                        sym = CCY_SYM.get(r["Market"], "")
-                        cash = r.get(f"Cash Δ {sym}")
-                        sd = r.get("Shares Δ")
-                        sd_str = f"{sd:+}" if isinstance(sd, (int, float)) and sd is not None else "?"
-                        lines.append(
-                            f"{r['Action']}  {r['Symbol']} ({r['Market']}): "
-                            f"{r['Adjust %']}%  {sd_str} sh @ {r['At price']} "
-                            f"→ target {r['Bar target']}"
-                            + (f"  cash {sym}{cash:+}" if isinstance(cash, (int, float)) else "")
-                        )
-                body = (
-                    f"{_tf_lbl.capitalize()} action plan "
-                    f"(act near the {_tf_lbl} bar close)\n\n"
-                    + "\n".join(lines)
-                    + "\n\nEducational info, not investment advice."
-                )
-                try:
-                    alertmod.send_email(
-                        _cfg, f"📈 {_tf_lbl.capitalize()} action plan — {len(todo)} action(s)", body)
-                    st.success("Emailed your action plan.")
-                except Exception as exc:
-                    st.error(f"Couldn't send email: {exc}")
-            if not alertmod.config_ready(_cfg):
-                st.caption("ℹ️ Set up email in the 🔔 Alerts tab to enable emailing this plan.")
-
-            st.divider()
-            st.markdown("#### 📋 Detailed exit reference (targets & stops)")
-            exit_df = pd.DataFrame(exit_rows).sort_values(
-                "Exit score", ascending=False, na_position="last").reset_index(drop=True)
-            st.dataframe(
-                exit_df, use_container_width=True, hide_index=True,
-                column_config={
-                    "Ticker": st.column_config.LinkColumn(
-                        "Ticker", display_text=r"symbol=(.+)$"),
-                    "Exit score": st.column_config.ProgressColumn(
-                        "Exit score", min_value=0, max_value=100, format="%d"),
-                    "Exit %": st.column_config.NumberColumn("Exit %", format="%d%%"),
-                    "T1 %": st.column_config.NumberColumn("T1 %", format="%.1f%%"),
-                    "Gain %": st.column_config.NumberColumn("Gain %", format="%.1f%%"),
-                },
-            )
-            st.download_button(
-                "⬇️ Download exit plan CSV",
-                exit_df.to_csv(index=False).encode(),
-                file_name="exit_plan.csv", mime="text/csv",
-            )
-            st.caption(
-                "**Exit %** scales with the exit score: ≥65 exit fully, ≥50 trim half, "
-                "≥40 trim a quarter, else hold. **Sell @** = current price (place the "
-                "scale-out limit at/above it). **T1 (scale ~40%)** = first resistance — "
-                "book ~40% here to lock in a month's worth of gains; **T2 (runner)** = "
-                "full measured-move target for the remainder; **Trail stop @** = exit the "
-                "rest if it breaks below. Educational info, not investment advice."
-            )
 
 # ---------------------------- Alerts (tab_alerts) ----------------------------
 # TradingView has no public API to create alerts programmatically, so we hand
