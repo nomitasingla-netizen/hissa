@@ -2009,7 +2009,9 @@ with tab_sip:
         "daily chunks** across the top-3 leaders, and each chunk is placed as a "
         "**dip-buying ladder** (part at market, more queued lower). If the price "
         "falls, the lower rungs fill and your **average cost drops** — so a modest "
-        "recovery puts you back in profit."
+        "recovery puts you back in profit. Every scanned ETF is listed below with "
+        "the same row colours as the Breakout tab (green = momentum rising, red = "
+        "falling), but **only the top-3 leaders receive a cash allocation**."
     )
     for mkt in selected_markets:
         sym = CCY_SYM.get(mkt, "")
@@ -2046,16 +2048,24 @@ with tab_sip:
 
         daily_total = round(total_cash / deploy_days, 2) if total_cash else 0.0
         wsum = sum(s.breakout_score for s in top3) or 1.0
+        top3_syms = {s.ticker for s in top3}
 
+        # Show ALL scanned stocks/ETFs (sorted by breakout score), but only the
+        # top-3 leaders receive a cash allocation.
+        display_pool = sorted(pool, key=lambda s: s.breakout_score, reverse=True)
         sip_rows, ladder_rows = [], []
-        for s in top3:
+        for s in display_pool:
             t = s.targets or {}
             price = t.get("entry")
-            pct = round(s.breakout_score / wsum * 100, 1)
-            alloc = round(total_cash * pct / 100, 2) if total_cash else None
-            daily_chunk = round(daily_total * pct / 100, 2) if daily_total else None
-            units_day = int(daily_chunk // price) if (daily_chunk and price and price > 0) else None
-            avg_ladder = round(price * ladder_factor, 2) if (price and use_ladder) else None
+            in_top3 = s.ticker in top3_syms
+            if in_top3:
+                pct = round(s.breakout_score / wsum * 100, 1)
+                alloc = round(total_cash * pct / 100, 2) if total_cash else None
+                daily_chunk = round(daily_total * pct / 100, 2) if daily_total else None
+                units_day = int(daily_chunk // price) if (daily_chunk and price and price > 0) else None
+                avg_ladder = round(price * ladder_factor, 2) if (price and use_ladder) else None
+            else:
+                pct = alloc = daily_chunk = units_day = avg_ladder = None
             sip_rows.append({
                 "Ticker": tradingview_url(s.ticker),
                 "Symbol": s.ticker,
@@ -2073,8 +2083,9 @@ with tab_sip:
                 "T1 (scale ~40%)": t.get("target1"),
                 "T2 (runner)": t.get("target"),
                 "Stop": t.get("stop"),
+                "_delta": s.breakout_delta,
             })
-            if use_ladder and daily_chunk and price:
+            if in_top3 and use_ladder and daily_chunk and price:
                 for off, w in SIP_LADDER:
                     rung_amt = round(daily_chunk * w, 2)
                     rung_px = round(price * (1 + off), 2)
@@ -2089,11 +2100,13 @@ with tab_sip:
         sip_df = pd.DataFrame(sip_rows)
         if not use_ladder:
             sip_df = sip_df.drop(columns=["Avg if laddered"])
+        styler = sip_df.style.apply(_style_by_trend, axis=1)
         st.dataframe(
-            sip_df, use_container_width=True, hide_index=True,
+            styler, use_container_width=True, hide_index=True,
             column_config={
                 "Ticker": st.column_config.LinkColumn(
                     "Ticker", display_text=r"symbol=(.+)$"),
+                "_delta": None,  # hide helper column used for row colouring
                 "Breakout": st.column_config.ProgressColumn(
                     "Breakout", min_value=0, max_value=100, format="%d"),
                 "1W ago": st.column_config.NumberColumn(
