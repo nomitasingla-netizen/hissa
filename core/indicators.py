@@ -91,6 +91,39 @@ def bandwidth_percentile(bandwidth: pd.Series, lookback: int = 120) -> float:
     return float((recent < current).mean() * 100)
 
 
+def obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """On-Balance Volume — cumulative volume added on up days, subtracted on
+    down days. A rising OBV means volume is flowing in (accumulation); a falling
+    OBV while price holds up warns of distribution."""
+    direction = np.sign(close.diff().fillna(0.0))
+    return (direction * volume).cumsum()
+
+
+def cmf(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series,
+        window: int = 20) -> pd.Series:
+    """Chaikin Money Flow (−1..+1). Positive = buying pressure (money in),
+    negative = selling pressure (money leaving)."""
+    rng = (high - low).replace(0, np.nan)
+    mfm = ((close - low) - (high - close)) / rng          # money-flow multiplier
+    mfv = mfm.fillna(0.0) * volume                         # money-flow volume
+    denom = volume.rolling(window).sum().replace(0, np.nan)
+    return (mfv.rolling(window).sum() / denom).fillna(0.0)
+
+
+def mfi(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series,
+        period: int = 14) -> pd.Series:
+    """Money Flow Index (0..100) — a volume-weighted RSI. Falling MFI shows
+    money rotating out even if price is still holding."""
+    tp = (high + low + close) / 3.0
+    rmf = tp * volume
+    pos = rmf.where(tp.diff() > 0, 0.0)
+    neg = rmf.where(tp.diff() < 0, 0.0)
+    pos_sum = pos.rolling(period).sum()
+    neg_sum = neg.rolling(period).sum().replace(0, np.nan)
+    ratio = pos_sum / neg_sum
+    return (100 - 100 / (1 + ratio)).fillna(50.0)
+
+
 def relative_strength(close: pd.Series, bench_close: pd.Series, lookback: int = 60) -> float:
     """Ratio-line slope of ETF vs benchmark over lookback (percent).
 

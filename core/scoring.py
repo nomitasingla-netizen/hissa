@@ -67,6 +67,18 @@ EXIT_WEIGHTS = {
     "adx_fade": 0.12,
 }
 
+# Distribution / "money leaving" sub-scores (0-100, higher = heavier outflow).
+# Detects smart-money exiting even while price still looks OK: OBV/price
+# divergence and negative money-flow are weighted highest.
+DISTRIBUTION_WEIGHTS = {
+    "obv_div": 0.30,     # price holding highs while OBV rolls over
+    "cmf": 0.22,         # Chaikin Money Flow negative / falling
+    "downvol": 0.18,     # down-day volume dominating up-day volume
+    "rs_roll": 0.12,     # relative strength vs benchmark rolling over
+    "mfi": 0.10,         # Money Flow Index falling / below 50
+    "dist_days": 0.08,   # count of high-volume down days (O'Neil)
+}
+
 
 def _gaussian(x: float, center: float, width: float) -> float:
     """Bell curve peaking at 1.0 when x == center."""
@@ -82,8 +94,10 @@ class TimeframeResult:
     ok: bool
     breakout: float = 0.0
     exit: float = 0.0
+    distribution: float = 0.0
     breakout_parts: dict = field(default_factory=dict)
     exit_parts: dict = field(default_factory=dict)
+    distribution_parts: dict = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
 
 
@@ -206,6 +220,62 @@ def score_timeframe(df: pd.DataFrame, bench_df: pd.DataFrame | None) -> Timefram
     }
     exit_score = _weighted(exit_parts, EXIT_WEIGHTS)
 
+    # ---------------- Distribution sub-scores ("money leaving") ----------------
+    # These fire when volume/flow deteriorates even while price still holds up —
+    # the classic footprint of smart money selling into strength.
+    obv_line = ind.obv(close, volume)
+    cmf_v = float(ind.cmf(high, low, close, volume).iloc[last])
+    mfi_series = ind.mfi(high, low, close, volume)
+    mfi_v = float(mfi_series.iloc[last])
+    mfi_prev = float(mfi_series.iloc[last - 5]) if len(mfi_series) > 5 else mfi_v
+
+    # OBV/price divergence over ~15 bars: price near its recent high but OBV well
+    # off its own high => accumulation is quietly reversing.
+    div_score = 0.0
+    n = 15
+    if len(close) > n and len(obv_line) > n:
+        pr = close.tail(n)
+        ov = obv_line.tail(n)
+        pr_rank = float((pr.iloc[-1] - pr.min()) / ((pr.max() - pr.min()) or np.nan))
+        ov_rank = float((ov.iloc[-1] - ov.min()) / ((ov.max() - ov.min()) or np.nan))
+        if not (math.isnan(pr_rank) or math.isnan(ov_rank)):
+            # High price-rank with low OBV-rank => bearish divergence.
+            div_score = _clamp((pr_rank - ov_rank) * 150) if pr_rank >= 0.5 else 0.0
+
+    # Chaikin Money Flow: -0.10 or lower => full marks, +0.10 => zero.
+    cmf_score = _clamp((0.10 - cmf_v) / 0.20 * 100)
+
+    # Down-day volume dominance over the last 20 bars.
+    ret = close.diff().tail(20)
+    vol20 = volume.tail(20)
+    up_vol = float(vol20[ret > 0].sum())
+    dn_vol = float(vol20[ret < 0].sum())
+    dvr = dn_vol / (up_vol + dn_vol) if (up_vol + dn_vol) else 0.5
+    downvol_score = _clamp((dvr - 0.5) / 0.25 * 100)
+
+    # Relative strength rolling over (negative RS vs benchmark).
+    rs_roll_score = _clamp(-rel_str / 10 * 100)
+
+    # MFI falling and below the 50 midline.
+    mfi_score = _clamp((55 - mfi_v) / 25 * 100) if mfi_v < mfi_prev else 0.0
+
+    # Distribution days: down >0.7% on >1.3x average volume in last 25 bars.
+    vbase = volume.tail(45).head(20).mean() or 1.0
+    r25 = close.pct_change().tail(25)
+    v25 = volume.tail(25)
+    dist_days = int(((r25 < -0.007) & (v25 > 1.3 * vbase)).sum())
+    dist_days_score = _clamp(dist_days / 5 * 100)
+
+    distribution_parts = {
+        "obv_div": round(div_score, 1),
+        "cmf": round(cmf_score, 1),
+        "downvol": round(downvol_score, 1),
+        "rs_roll": round(rs_roll_score, 1),
+        "mfi": round(mfi_score, 1),
+        "dist_days": round(dist_days_score, 1),
+    }
+    distribution_score = _weighted(distribution_parts, DISTRIBUTION_WEIGHTS)
+
     # Signal line as % of price + how long MACD has hugged the zero line.
     signal_v = float(signal_line.iloc[last])
     signal_pct = signal_v / price * 100
@@ -229,6 +299,10 @@ def score_timeframe(df: pd.DataFrame, bench_df: pd.DataFrame | None) -> Timefram
         "bandwidth_pct_rank": round(float(bw_pct), 0),
         "rel_strength_pct": round(float(rel_str), 2),
         "vol_ratio": round(float(vol_ratio), 2),
+        "avg_vol": round(float(vol_base), 0) if vol_base else None,
+        "cmf": round(cmf_v, 3),
+        "mfi": round(mfi_v, 1),
+        "dist_days": dist_days,
         "ema20_atr_ext": round(float(ema_ext_atr), 2),
         "dist_200dma_pct": round(float(dist_200), 2) if dist_200 is not None else None,
     }
@@ -237,8 +311,10 @@ def score_timeframe(df: pd.DataFrame, bench_df: pd.DataFrame | None) -> Timefram
         ok=True,
         breakout=round(breakout, 1),
         exit=round(exit_score, 1),
+        distribution=round(distribution_score, 1),
         breakout_parts=breakout_parts,
         exit_parts=exit_parts,
+        distribution_parts=distribution_parts,
         raw=raw,
     )
 
@@ -254,6 +330,7 @@ class SectorScore:
     breakout_delta: float = 0.0
     breakout_trend: str = "→ Flat"
     exit_delta: float = 0.0
+    distribution_score: float = 0.0
     targets: dict = field(default_factory=dict)
     consolidation: dict = field(default_factory=dict)
     action: str = ""
@@ -496,6 +573,52 @@ def classify(breakout: float, exit_score: float) -> str:
     return "⚪ NEUTRAL / AVOID"
 
 
+def lifecycle_stage(breakout: float, exit_score: float, distribution: float,
+                    dma200_falling: bool = False) -> dict:
+    """Map the breakout / exit / distribution scores onto a 5-stage market
+    lifecycle (Wyckoff / Stan-Weinstein style). Priority is top-down: an active
+    distribution/decline read overrides a still-bullish breakout score, because
+    money leaving is the most actionable warning.
+
+    Returns a dict: {order, stage, label, action, color} where ``order`` sorts
+    the table 1→5 (accumulate → decline) and ``color`` is a hex background.
+    """
+    # Stage 5 — Decline / Markdown: trend broken, price under a falling 200-DMA.
+    if dma200_falling and breakout < 40 and distribution >= 45:
+        return {"order": 5, "stage": "5 · Decline",
+                "label": "⚫ Stage 5 — Decline / Markdown",
+                "action": "Avoid — downtrend; wait for a new base to form",
+                "color": "#3a3f44"}
+    # Stage 4 — Distribution / Topping: money leaving while price still holds.
+    if distribution >= 60 or (distribution >= 50 and exit_score >= 45):
+        return {"order": 4, "stage": "4 · Distribution",
+                "label": "🔴 Stage 4 — Distribution / Topping",
+                "action": "Exit / take profits — smart money is selling",
+                "color": "#b23b3b"}
+    # Stage 3 — Stretched / Extended: still up but overheated.
+    if exit_score >= 50:
+        return {"order": 3, "stage": "3 · Stretched",
+                "label": "🟠 Stage 3 — Stretched / Extended",
+                "action": "Trim & trail stop — overheated, tighten risk",
+                "color": "#c77d3a"}
+    # Stage 2 — Breakout / Markup: trend firing.
+    if breakout >= 58 and exit_score < 50:
+        return {"order": 2, "stage": "2 · Breakout",
+                "label": "🟢 Stage 2 — Breakout / Markup",
+                "action": "Hold / add on strength — trend is running",
+                "color": "#1e7d46"}
+    # Stage 1 — Basing / Consolidating: coiling, about to break.
+    if breakout >= 45:
+        return {"order": 1, "stage": "1 · Consolidating",
+                "label": "🟡 Stage 1 — Basing / Consolidating",
+                "action": "Accumulate small — coiling, watch for the trigger",
+                "color": "#b3952f"}
+    return {"order": 6, "stage": "0 · Neutral",
+            "label": "⚪ Neutral — no edge",
+            "action": "No position — no clear stage yet",
+            "color": ""}
+
+
 def score_sector(
     ticker: str, name: str, frames: dict, bench_frames: dict,
     timeframes: tuple[str, ...] = ("4h", "1d"),
@@ -507,9 +630,11 @@ def score_sector(
 
     breakout_vals = {k: (tf[k].breakout if tf[k].ok else None) for k in TIMEFRAMES}
     exit_vals = {k: (tf[k].exit if tf[k].ok else None) for k in TIMEFRAMES}
+    dist_vals = {k: (tf[k].distribution if tf[k].ok else None) for k in TIMEFRAMES}
 
     setup_quality = round(_blend(breakout_vals, timeframes), 1)
     exit_score = round(_blend(exit_vals, timeframes), 1)
+    distribution_score = round(_blend(dist_vals, timeframes), 1)
 
     # ---- Score trend: re-score a few bars back and compare ----
     prev_breakout_vals: dict[str, float | None] = {}
@@ -577,6 +702,7 @@ def score_sector(
         breakout_delta=breakout_delta,
         breakout_trend=_trend_label(breakout_delta),
         exit_delta=exit_delta,
+        distribution_score=distribution_score,
         targets=targets,
         consolidation=consolidation,
         action=action,

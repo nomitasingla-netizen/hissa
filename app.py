@@ -15,7 +15,7 @@ from core.data import fetch_ohlcv, truncate_frames, get_fund_info
 import core.etfs as etfs
 import core.stocks as stocks
 from core.etfs import MARKETS, LOAD_ERRORS
-from core.scoring import score_sector, breakout_snapshot
+from core.scoring import score_sector, breakout_snapshot, lifecycle_stage, PRIMARY_ORDER
 from core.patterns import detect_breakout_retest
 import core.ipos as ipos
 import core.alerts as alertmod
@@ -957,10 +957,10 @@ def _days_held(hist) -> int:
 
 
 
-tab_exit, tab_sip, tab1, tab2, tab3, tab_rate, tab4, tab5, tab6, tab7, tab_alerts = st.tabs(
+tab_exit, tab_sip, tab1, tab2, tab3, tab_rate, tab_life, tab4, tab5, tab6, tab7, tab_alerts = st.tabs(
     ["🎯 Exit plan — your holdings", "📅 SIP & Exit Plan", "🚀 Breakout Candidates",
-     "💰 Allocation", "🔴 Exit Watch", "⭐ Rate My List", "🔎 Details",
-     "🔁 52W-High Retest", "🆕 NSE IPOs near launch",
+     "💰 Allocation", "🔴 Exit Watch", "⭐ Rate My List", "🔄 Sector Lifecycle",
+     "🔎 Details", "🔁 52W-High Retest", "🆕 NSE IPOs near launch",
      "🎯 Near-Zero MACD Coil", "🔔 Alerts"]
 )
 
@@ -1477,6 +1477,160 @@ with tab_rate:
         )
     else:
         st.info("Upload a file and press **Rate these stocks** to see scores.")
+
+with tab_life:
+    st.subheader("🔄 Sector Lifecycle — basing → breakout → stretched → distribution")
+    st.caption(
+        "Every scanned sector/ETF placed on the **market lifecycle**: 🟡 Stage 1 "
+        "*basing/consolidating* → 🟢 Stage 2 *breakout/markup* → 🟠 Stage 3 "
+        "*stretched* → 🔴 Stage 4 *distribution (money leaving)* → ⚫ Stage 5 "
+        "*decline*. Distribution is detected from **OBV/price divergence, Chaikin "
+        "Money Flow, down-day volume, relative-strength roll-over and high-volume "
+        "down days** — the footprint of investors pulling money out even while "
+        "price still holds. Rows are colour-coded and sorted Stage 1→5."
+    )
+    st.info(
+        f"⏱️ Scores use the active timeframe **{tf_choice}** (set in the sidebar). "
+        "Pair **Blend (1D + 1W)** for steadier stage reads."
+    )
+
+    if not scan_ready:
+        st.info("Run a scan from the sidebar to populate the lifecycle view.")
+    else:
+        def _primary_raw(s):
+            """Raw indicators from the primary timeframe of the active blend."""
+            key = next((k for k in PRIMARY_ORDER
+                        if k in selected_tf and s.tf.get(k) and s.tf[k].ok),
+                       next((k for k in PRIMARY_ORDER
+                             if s.tf.get(k) and s.tf[k].ok), None))
+            return s.tf[key].raw if key else {}
+
+        def _fmt_vol(v):
+            if not v:
+                return "—"
+            v = float(v)
+            for unit, div in (("M", 1e6), ("K", 1e3)):
+                if v >= div:
+                    return f"{v/div:.1f}{unit}"
+            return f"{v:.0f}"
+
+        VOL_SIGNIF = 1.3   # recent volume ≥1.3× its baseline = "significant"
+
+        for mkt in selected_markets:
+            pool = [s for m, s in results if m == mkt]
+            if not pool:
+                st.info(f"No {mkt} sectors scanned yet.")
+                continue
+
+            rows, actionable, dist_warn = [], [], []
+            for s in pool:
+                raw = _primary_raw(s)
+                dist_200 = raw.get("dist_200dma_pct")
+                dma_falling = dist_200 is not None and dist_200 < 0
+                stg = lifecycle_stage(
+                    s.breakout_score, s.exit_score, s.distribution_score, dma_falling)
+                vol_ratio = raw.get("vol_ratio")
+                signif = bool(vol_ratio and vol_ratio >= VOL_SIGNIF)
+                rows.append({
+                    "_order": stg["order"],
+                    "_break": s.breakout_score,
+                    "_color": stg["color"],
+                    "Stage": stg["stage"],
+                    "Ticker": tradingview_url(s.ticker),
+                    "Symbol": s.ticker,
+                    "Sector": s.name,
+                    "Breakout": s.breakout_score,
+                    "Exit": s.exit_score,
+                    "Distribution": s.distribution_score,
+                    "RS %": raw.get("rel_strength_pct"),
+                    "CMF": raw.get("cmf"),
+                    "Vol ×": round(vol_ratio, 2) if vol_ratio else None,
+                    "Avg vol": _fmt_vol(raw.get("avg_vol")),
+                    "Big vol?": "✅" if signif else "",
+                    "What to do": stg["action"],
+                })
+                if stg["order"] in (1, 2) and signif:
+                    actionable.append((s, stg, vol_ratio))
+                if stg["order"] == 4 and signif:
+                    dist_warn.append((s, vol_ratio))
+
+            life_df = (pd.DataFrame(rows)
+                       .sort_values(["_order", "_break"], ascending=[True, False])
+                       .reset_index(drop=True))
+
+            def _stage_color(row):
+                c = row["_color"]
+                style = (f"background-color: {c}; color: #ffffff; font-weight: 600"
+                         if c else "")
+                return [style] * len(row)
+
+            st.markdown(f"### {mkt} market")
+
+            # -------- Suggested ETFs with significant volume --------
+            if actionable:
+                actionable.sort(key=lambda x: x[0].breakout_score, reverse=True)
+                picks = " · ".join(
+                    f"**{s.ticker}** ({s.name}, {stg['stage'].split(' · ')[1]}, "
+                    f"{vr:.1f}× vol)"
+                    for s, stg, vr in actionable[:8]
+                )
+                st.success(
+                    "✅ **Actionable now — basing/breakout sectors backed by "
+                    f"significant volume:** {picks}"
+                )
+            else:
+                st.caption(
+                    "No basing/breakout sectors with significant volume right now — "
+                    "wait for a volume-backed setup."
+                )
+            if dist_warn:
+                dist_warn.sort(key=lambda x: x[0].distribution_score, reverse=True)
+                dpicks = " · ".join(
+                    f"**{s.ticker}** ({s.name}, {vr:.1f}× vol)" for s, vr in dist_warn[:8])
+                st.error(
+                    "🔴 **Distribution on heavy volume — investors exiting, "
+                    f"reduce/avoid:** {dpicks}"
+                )
+
+            styler = life_df.style.apply(_stage_color, axis=1)
+            st.dataframe(
+                styler, use_container_width=True, hide_index=True,
+                column_config={
+                    "_order": None, "_break": None, "_color": None,
+                    "Ticker": st.column_config.LinkColumn(
+                        "Ticker", display_text=r"symbol=(.+)$"),
+                    "Breakout": st.column_config.ProgressColumn(
+                        "Breakout", min_value=0, max_value=100, format="%d"),
+                    "Exit": st.column_config.ProgressColumn(
+                        "Exit", min_value=0, max_value=100, format="%d"),
+                    "Distribution": st.column_config.ProgressColumn(
+                        "Distribution", help="Money-leaving pressure (OBV/CMF/"
+                        "down-volume/RS)", min_value=0, max_value=100, format="%d"),
+                    "RS %": st.column_config.NumberColumn(
+                        "RS %", help="Relative strength vs benchmark", format="%.1f%%"),
+                    "CMF": st.column_config.NumberColumn(
+                        "CMF", help="Chaikin Money Flow (+ in / − out)", format="%.2f"),
+                    "Vol ×": st.column_config.NumberColumn(
+                        "Vol ×", help="Recent vs baseline volume", format="%.2f×"),
+                    "Big vol?": st.column_config.TextColumn(
+                        "Big vol?", help=f"Recent volume ≥ {VOL_SIGNIF}× baseline"),
+                },
+            )
+            st.download_button(
+                "⬇️ Download lifecycle CSV",
+                life_df.drop(columns=["_order", "_break", "_color"]).to_csv(
+                    index=False).encode(),
+                file_name=f"sector_lifecycle_{mkt}.csv", mime="text/csv",
+                key=f"life_dl_{mkt}",
+            )
+        st.caption(
+            "**Distribution score** rises when smart money is leaving: OBV falling "
+            "while price holds, negative/declining Chaikin Money Flow, down-day "
+            "volume dominance, relative strength rolling over, and clusters of "
+            "high-volume down days. **Big vol? ✅** marks ETFs whose recent volume "
+            f"is ≥ {VOL_SIGNIF}× their baseline — the liquid, tradeable names. "
+            "Educational info, not investment advice."
+        )
 
 with tab4:
     st.subheader("Per-sector breakdown")
