@@ -1034,8 +1034,9 @@ def _days_held(hist) -> int:
 
 
 
-tab_exit, tab_trigger, tab_sip, tab1, tab2, tab3, tab_rate, tab_life, tab_flows, tab4, tab5, tab6, tab7, tab_alerts = st.tabs(
-    ["🎯 Exit plan — your holdings", "⚡ Breakout Trigger", "📅 SIP & Exit Plan",
+SHOW_SIP_TAB = False  # SIP & Exit Plan tab hidden; flip to True to restore it
+tab_exit, tab_trigger, tab1, tab2, tab3, tab_rate, tab_life, tab_flows, tab4, tab5, tab6, tab7, tab_alerts = st.tabs(
+    ["🎯 Exit plan — your holdings", "⚡ Breakout Trigger",
      "🚀 Breakout Candidates", "💰 Allocation", "🔴 Exit Watch", "⭐ Rate My List",
      "🔄 Sector Lifecycle", "🏦 Institutional Flows", "🔎 Details", "🔁 52W-High Retest",
      "🆕 NSE IPOs near launch", "🎯 Near-Zero MACD Coil", "🔔 Alerts"]
@@ -2626,7 +2627,8 @@ with tab7:
                 "range low / 1.5·ATR. Educational info, not investment advice."
             )
 
-with tab_sip:
+if SHOW_SIP_TAB:
+  with tab_sip:
     st.subheader("📅 SIP & Exit Plan — weekly-primary rotation (~5%/month)")
     st.caption(
         "Built for a steady ~5%/month rotation: **accumulate (SIP)** into the top-3 "
