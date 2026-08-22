@@ -15,10 +15,11 @@ from core.data import fetch_ohlcv, truncate_frames, get_fund_info
 import core.etfs as etfs
 import core.stocks as stocks
 from core.etfs import MARKETS, LOAD_ERRORS
-from core.scoring import score_sector, breakout_snapshot, lifecycle_stage, PRIMARY_ORDER
+from core.scoring import score_sector, breakout_snapshot, imminence_snapshot, score_snapshot, lifecycle_stage, PRIMARY_ORDER
 from core.patterns import detect_breakout_retest
 import core.ipos as ipos
 import core.alerts as alertmod
+import core.flows as flows
 
 st.set_page_config(page_title="Sector Breakout Scanner", layout="wide", page_icon="📈")
 
@@ -267,6 +268,8 @@ def run_scan(markets: list[str], lists: dict[str, dict], timeframes: tuple,
                 ticker, name, frames, bench_frames, timeframes, "1w")
             score.breakout_2w_ago = breakout_snapshot(
                 ticker, name, frames, bench_frames, timeframes, "2w")
+            score.imminence_1w_ago = imminence_snapshot(
+                ticker, name, frames, bench_frames, timeframes, "1w")
             results.append((mkt, score))
         except Exception as exc:  # keep scanning even if one ticker fails
             st.warning(f"Failed to score {ticker}: {exc}")
@@ -358,6 +361,8 @@ def build_score_df(scored: list, with_aum: bool) -> pd.DataFrame:
                 "Sector": s.name,
                 "AUM": aum_str,
                 "Breakout": s.breakout_score,
+                "HNI flow": s.accumulation_score,
+                "Vol score": s.volume_score,
                 "1W ago": s.breakout_1w_ago,
                 "2W ago": s.breakout_2w_ago,
                 "Trend": f"{s.breakout_trend} ({s.breakout_delta:+.1f})",
@@ -459,6 +464,8 @@ def run_list_scan(pairs: list[dict], market: str, timeframes: tuple) -> list:
                 p["yf"], p["name"], frames, bench, timeframes, "1w")
             s.breakout_2w_ago = breakout_snapshot(
                 p["yf"], p["name"], frames, bench, timeframes, "2w")
+            s.imminence_1w_ago = imminence_snapshot(
+                p["yf"], p["name"], frames, bench, timeframes, "1w")
             out.append((market, s))
         except Exception as exc:
             st.warning(f"Failed to score {p['yf']}: {exc}")
@@ -494,6 +501,19 @@ def render_table(frame):
         "_delta": None,  # hide helper column
         "Breakout": st.column_config.ProgressColumn(
             "Breakout", min_value=0, max_value=100, format="%d"
+        ),
+        "HNI flow": st.column_config.ProgressColumn(
+            "HNI flow", help="Smart-money / HNI accumulation proxy — how strongly "
+            "large investors appear to be buying, from Chaikin Money Flow, up-day "
+            "volume dominance, OBV confirmation, Money-Flow Index and relative "
+            "strength (0 = distribution, 100 = heavy accumulation)",
+            min_value=0, max_value=100, format="%d"
+        ),
+        "Vol score": st.column_config.ProgressColumn(
+            "Vol score", help="Volume-confirmation score — is recent volume expanding "
+            "to back the move (ideal ≈1.3–1.6× baseline). Low = volume dry-up, "
+            "100 = strong volume thrust",
+            min_value=0, max_value=100, format="%d"
         ),
         "1W ago": st.column_config.NumberColumn(
             "1W ago", help="Breakout score as of ~1 week ago", format="%d"
@@ -594,6 +614,9 @@ def score_holding_cached(ticker: str, market: str, timeframes: tuple):
     bench = load_frames(MARKETS[market]["benchmark"])
     frames = load_frames(ticker)
     s = score_sector(ticker, ticker, frames, bench, timeframes)
+    snap_1w = score_snapshot(ticker, ticker, frames, bench, timeframes, "1w")
+    imm_1w = snap_1w.imminence if snap_1w else None
+    exit_imm_1w = snap_1w.exit_imminence if snap_1w else None
     return {
         "exit_score": s.exit_score,
         "breakout": s.breakout_score,
@@ -607,6 +630,20 @@ def score_holding_cached(ticker: str, market: str, timeframes: tuple):
         "breakout_level": (s.targets or {}).get("breakout_level"),
         "cons_days": (s.consolidation or {}).get("days"),
         "rsi": s.tf["1d"].raw.get("rsi") if s.tf["1d"].ok else None,
+        # ---- Breakout-trigger (imminence) algorithm fields ----
+        "imminence": s.imminence,
+        "imminence_label": s.imminence_label,
+        "imminence_note": s.imminence_note,
+        "imminence_1w_ago": imm_1w,
+        "dist_to_breakout_pct": s.dist_to_breakout_pct,
+        "range_position": s.range_position,
+        "accumulation": s.accumulation_score,
+        "volume_score": s.volume_score,
+        # ---- Breakdown-trigger (exit-imminence) algorithm fields ----
+        "exit_imminence": s.exit_imminence,
+        "exit_imminence_label": s.exit_imminence_label,
+        "exit_imminence_note": s.exit_imminence_note,
+        "exit_imminence_1w_ago": exit_imm_1w,
     }
 
 
@@ -702,6 +739,11 @@ def daily_action(sc):
     add / trim / exit / hold. ADD when the setup is still building (strong
     breakout, low exit) and price is above its stop but below the first target;
     TRIM at the first target or a rising exit score; EXIT when over-extended.
+
+    The **ADD** side uses the Breakout-Trigger algorithm: a strong base
+    (readiness) is not enough — the breakout must actually be *firing* now
+    (imminence). A ready-but-dormant base is held, not added to, which avoids
+    piling into names that quietly coil for weeks (the ITB problem).
     """
     b = sc.get("breakout") or 0
     e = sc.get("exit_score") or 0
@@ -710,21 +752,56 @@ def daily_action(sc):
     t1 = sc.get("target1")
     t2 = sc.get("target")
     stop = sc.get("stop")
+    imm = sc.get("imminence")
+    imm = imm if imm is not None else 50  # neutral if the trigger can't be scored
+    xi = sc.get("exit_imminence")
+    xi = xi if xi is not None else 50  # neutral if the breakdown trigger is n/a
 
+    # ---- Hard exits: non-negotiable regardless of the breakdown trigger ----
     if e >= 65 or rsi >= 80 or (t2 and price and price >= t2):
         return {"side": "exit", "label": "🔴 EXIT — over-extended",
                 "pct": 100, "act_price": price, "day_target": t2 or price}
-    if e >= 50 or (t1 and price and price >= t1):
-        return {"side": "trim", "label": "🟠 TRIM — book partial",
-                "pct": 40, "act_price": price, "day_target": t1 or price}
+    # Hitting the first target is a prudent book-partial on its own.
+    if t1 and price and price >= t1:
+        return {"side": "trim", "label": "🟠 TRIM — booked at target",
+                "pct": 40, "act_price": price, "day_target": t1}
+    # ---- TRIM side, gated by the breakdown trigger (exit-imminence) ----
+    # Symmetric to the ADD gating: being *extended* isn't enough — trim harder
+    # only when a top is actually *firing* now (price losing support, selling
+    # volume expanding, momentum rolling down). Extended-but-still-trending
+    # winners are trimmed lightly / left to run instead of dumped early.
+    if e >= 50:
+        if xi >= 52:
+            return {"side": "trim", "label": "🔴 TRIM — extended + rolling over",
+                    "pct": 40, "act_price": price, "day_target": t1 or price}
+        if xi >= 32:
+            return {"side": "trim", "label": "🟠 TRIM — extended, wobbling",
+                    "pct": 25, "act_price": price, "day_target": t1 or price}
+        return {"side": "trim", "label": "🟡 TRIM light — extended, still holding",
+                "pct": 15, "act_price": price, "day_target": t1 or price}
     if e >= 40:
-        return {"side": "trim", "label": "🟡 TRIM light — watch",
-                "pct": 25, "act_price": price, "day_target": t1 or price}
-    if b >= 58 and e < 45 and price and stop and price > stop and (not t1 or price < t1):
-        add_pct = 30 if b >= 70 else 20 if b >= 64 else 10
-        return {"side": "add", "label": "🟢 ADD — accumulate",
+        if xi >= 52:
+            return {"side": "trim", "label": "🟠 TRIM — breakdown firing",
+                    "pct": 25, "act_price": price, "day_target": t1 or price}
+        return {"side": "hold", "label": "🟢 HOLD — extended, no breakdown yet",
+                "pct": 0, "act_price": price, "day_target": t1 or price}
+    # ---- ADD side, gated by the breakout trigger (imminence) ----
+    base_ok = b >= 58 and e < 45 and price and stop and price > stop and (not t1 or price < t1)
+    if base_ok and imm >= 55:
+        # Ready AND firing — scale add size by how strong the trigger is.
+        add_pct = 30 if imm >= 70 else 20 if imm >= 62 else 15
+        return {"side": "add", "label": "🟢 ADD — ready + firing",
                 "pct": add_pct, "act_price": round(price * 0.99, 2),
                 "day_target": t1 or price}
+    if base_ok and imm >= 40:
+        # Ready, trigger building — small starter add only.
+        return {"side": "add", "label": "🟢 ADD small — trigger building",
+                "pct": 10, "act_price": round(price * 0.99, 2),
+                "day_target": t1 or price}
+    if base_ok:
+        # Ready but no trigger (coiling) — do NOT add; wait for it to fire.
+        return {"side": "hold", "label": "⏳ HOLD — ready, no trigger yet",
+                "pct": 0, "act_price": price, "day_target": t1 or price}
     return {"side": "hold", "label": "⚪ HOLD — do nothing",
             "pct": 0, "act_price": price, "day_target": t1 or price}
 
@@ -957,11 +1034,11 @@ def _days_held(hist) -> int:
 
 
 
-tab_exit, tab_sip, tab1, tab2, tab3, tab_rate, tab_life, tab4, tab5, tab6, tab7, tab_alerts = st.tabs(
-    ["🎯 Exit plan — your holdings", "📅 SIP & Exit Plan", "🚀 Breakout Candidates",
-     "💰 Allocation", "🔴 Exit Watch", "⭐ Rate My List", "🔄 Sector Lifecycle",
-     "🔎 Details", "🔁 52W-High Retest", "🆕 NSE IPOs near launch",
-     "🎯 Near-Zero MACD Coil", "🔔 Alerts"]
+tab_exit, tab_trigger, tab_sip, tab1, tab2, tab3, tab_rate, tab_life, tab_flows, tab4, tab5, tab6, tab7, tab_alerts = st.tabs(
+    ["🎯 Exit plan — your holdings", "⚡ Breakout Trigger", "📅 SIP & Exit Plan",
+     "🚀 Breakout Candidates", "💰 Allocation", "🔴 Exit Watch", "⭐ Rate My List",
+     "🔄 Sector Lifecycle", "🏦 Institutional Flows", "🔎 Details", "🔁 52W-High Retest",
+     "🆕 NSE IPOs near launch", "🎯 Near-Zero MACD Coil", "🔔 Alerts"]
 )
 
 with tab_exit:
@@ -1133,6 +1210,13 @@ with tab_exit:
                         "Bar target": act["day_target"],
                         "Breakout above": bw["trigger"],
                         "Breakout watch": bw["status"],
+                        "Trigger": sc.get("imminence_label"),
+                        "Imminence": sc.get("imminence"),
+                        "Imm 1w ago": sc.get("imminence_1w_ago"),
+                        "% to line": sc.get("dist_to_breakout_pct"),
+                        "Breakdown": sc.get("exit_imminence_label"),
+                        "Breakdown score": sc.get("exit_imminence"),
+                        "Bkdn 1w ago": sc.get("exit_imminence_1w_ago"),
                         f"Cash Δ {sym}": cash_delta,
                         "Held days": held_days,
                         "Trades": n_trades,
@@ -1199,8 +1283,16 @@ with tab_exit:
                 "above** = the price that must be crossed to confirm the breakout; "
                 "**Breakout watch** shows ✅ once it clears, or ⏳/⌛ how long it's "
                 f"been coiling (a name still stuck after {breakout_patience}d is "
-                "flagged stale and trimmed). **Cash Δ** is "
-                "negative when you deploy cash, positive when you free it."
+                "flagged stale and trimmed). **Trigger / Imminence** apply the "
+                "Breakout-Trigger algorithm to your holdings: an **ADD** only fires "
+                "when the base is *ready AND the trigger is firing* — a ready-but-"
+                "dormant name shows *⏳ HOLD — ready, no trigger yet* instead of "
+                "adding, so you don't pile into something quietly coiling. "
+                "**Breakdown / Breakdown score** are the downside mirror: a **TRIM/"
+                "EXIT** scales with whether a *top is actually firing now* — an "
+                "extended-but-still-trending winner is trimmed lightly (or held to "
+                "let it run), and only a real roll-over is cut hard. **Cash Δ** "
+                "is negative when you deploy cash, positive when you free it."
                 + (" **Held days / Trades / History note** come from your order "
                    "history — a repeat ADD (just bought) or repeat TRIM (just sold) "
                    "is held back to HOLD this bar; a true over-extended EXIT still "
@@ -1215,6 +1307,29 @@ with tab_exit:
                     "Gain %": st.column_config.NumberColumn("Gain %", format="%.1f%%"),
                     "Breakout": st.column_config.ProgressColumn(
                         "Breakout", min_value=0, max_value=100, format="%d"),
+                    "Imminence": st.column_config.ProgressColumn(
+                        "Imminence", help="Breakout-trigger score — is the breakout "
+                        "firing NOW (price at the line, volume expanding, ADX rising, "
+                        "squeeze firing, MACD growing). ADD calls require this, not "
+                        "just a strong base", min_value=0, max_value=100, format="%d"),
+                    "Imm 1w ago": st.column_config.NumberColumn(
+                        "Imm 1w ago", help="Trigger score ~1 week ago — compare with "
+                        "Imminence to see if the trigger is building or fading",
+                        format="%d"),
+                    "% to line": st.column_config.NumberColumn(
+                        "% to line", help="Distance from price to the breakout line "
+                        "(+ = still below, − = already above)", format="%.1f%%"),
+                    "Breakdown score": st.column_config.ProgressColumn(
+                        "Breakdown score", help="Breakdown-trigger score — is a TOP "
+                        "firing NOW (price losing support, selling volume expanding, "
+                        "momentum rolling over, %B falling, money flowing out). TRIM/"
+                        "EXIT size scales with this — extended-but-holding winners are "
+                        "trimmed lightly, only real roll-overs are cut hard",
+                        min_value=0, max_value=100, format="%d"),
+                    "Bkdn 1w ago": st.column_config.NumberColumn(
+                        "Bkdn 1w ago", help="Breakdown-trigger score ~1 week ago — "
+                        "compare with Breakdown score to see if the roll-over is "
+                        "building or easing", format="%d"),
                     "Exit score": st.column_config.ProgressColumn(
                         "Exit score", min_value=0, max_value=100, format="%d"),
                 },
@@ -1477,6 +1592,370 @@ with tab_rate:
         )
     else:
         st.info("Upload a file and press **Rate these stocks** to see scores.")
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_fii_dii():
+    return flows.fii_dii()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_large_deals():
+    return flows.large_deals()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_delivery():
+    return flows.delivery_data()
+
+
+with tab_flows:
+    st.subheader("🏦 Institutional Flows — FII/DII, big-money deals & delivery (NSE)")
+    st.caption(
+        "See whether **big money is adding or pulling out** — sourced live from "
+        "NSE. **FII/DII** shows market-wide net cash flow; **bulk & block deals** "
+        "name the *fund house / HNI / broker* on each large trade with an "
+        "approximate **₹ value**; **delivery %** flags genuine accumulation vs "
+        "intraday churn. 🇮🇳 India only — NSE publishes these; the US equivalent "
+        "(quarterly 13F / ETF creation-redemption) isn't a daily feed."
+    )
+    if st.button("🔄 Refresh institutional data (clears cache)", key="flows_refresh"):
+        fetch_fii_dii.clear()
+        fetch_large_deals.clear()
+        fetch_delivery.clear()
+        st.rerun()
+    st.caption("Data is cached ~30 min. Figures are provisional and update after "
+               "market close on trading days.")
+
+    # -------------------- 1) FII / DII net cash flow --------------------
+    st.markdown("### 1️⃣ FII/DII net cash flow (market-wide)")
+    try:
+        fd = fetch_fii_dii()
+        date_str = fd["Date"].iloc[0] if not fd.empty else ""
+        cols = st.columns(len(fd))
+        for col, (_, r) in zip(cols, fd.iterrows()):
+            net = r["Net ₹cr"] or 0
+            col.metric(
+                f"{r['Category']} net",
+                f"₹{net:,.0f} cr",
+                delta=("Buying" if net >= 0 else "Selling"),
+                delta_color=("normal" if net >= 0 else "inverse"),
+            )
+        st.caption(f"Provisional cash-market figures for **{date_str}**. "
+                   "Positive net = institutions are net buyers that day.")
+        st.dataframe(
+            fd, use_container_width=True, hide_index=True,
+            column_config={
+                "Buy ₹cr": st.column_config.NumberColumn("Buy ₹cr", format="%.0f"),
+                "Sell ₹cr": st.column_config.NumberColumn("Sell ₹cr", format="%.0f"),
+                "Net ₹cr": st.column_config.NumberColumn("Net ₹cr", format="%.0f"),
+            },
+        )
+    except Exception as exc:
+        st.warning(f"⚠️ Couldn't load FII/DII data right now: {exc}")
+
+    # -------------------- 2) Bulk & block deals --------------------
+    st.markdown("### 2️⃣ Bulk & block deals — who added / trimmed money")
+    st.caption(
+        "Each row is a **large trade reported to NSE** with the counterparty "
+        "named. **Value ₹cr ≈ Qty × avg price.** Bulk = ≥0.5% of shares on the "
+        "exchange; block = negotiated large trades. Use *Net by client* to see "
+        "which fund house/HNI added the most money today."
+    )
+    try:
+        ld = fetch_large_deals()
+        st.caption(f"As on **{ld['as_on']}** · {len(ld['bulk'])} bulk · "
+                   f"{len(ld['block'])} block deals.")
+        which = st.radio("Deal type", ["Bulk deals", "Block deals"],
+                         horizontal=True, key="deal_type")
+        deals = ld["bulk"] if which == "Bulk deals" else ld["block"]
+
+        if deals is None or deals.empty:
+            st.info(f"No {which.lower()} reported for this session.")
+        else:
+            side = st.radio("Show", ["All", "Buys only", "Sells only"],
+                            horizontal=True, key="deal_side")
+            view = deals
+            if side == "Buys only":
+                view = deals[deals["Side"].str.upper() == "BUY"]
+            elif side == "Sells only":
+                view = deals[deals["Side"].str.upper() == "SELL"]
+
+            a, b = st.columns(2)
+            with a:
+                st.markdown("**💰 Net by client (fund/HNI) — ₹cr**")
+                nbc = flows.net_by_client(deals, 15)
+                st.dataframe(
+                    nbc, use_container_width=True, hide_index=True,
+                    column_config={"Net ₹cr": st.column_config.NumberColumn(
+                        "Net ₹cr", format="%.2f")},
+                )
+            with b:
+                st.markdown("**🏷️ Net by stock — ₹cr**")
+                nbs = flows.net_by_symbol(deals, 15)
+                st.dataframe(
+                    nbs, use_container_width=True, hide_index=True,
+                    column_config={"Net ₹cr": st.column_config.NumberColumn(
+                        "Net ₹cr", format="%.2f")},
+                )
+
+            st.markdown("**📋 All deals**")
+            st.dataframe(
+                view.sort_values("Value ₹cr", ascending=False),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "Qty": st.column_config.NumberColumn("Qty", format="%d"),
+                    "Avg price": st.column_config.NumberColumn(
+                        "Avg price", format="%.2f"),
+                    "Value ₹cr": st.column_config.NumberColumn(
+                        "Value ₹cr", format="%.2f"),
+                },
+            )
+            st.download_button(
+                "⬇️ Download deals CSV",
+                view.to_csv(index=False).encode(),
+                file_name=f"{which.replace(' ', '_').lower()}.csv",
+                mime="text/csv", key="deals_dl",
+            )
+    except Exception as exc:
+        st.warning(f"⚠️ Couldn't load bulk/block deals right now: {exc}")
+
+    # -------------------- 3) Delivery % --------------------
+    st.markdown("### 3️⃣ Delivery % — accumulation conviction")
+    st.caption(
+        "**Delivery %** = shares actually taken into demat vs total traded. "
+        "A high and rising delivery % on an up day means buyers are *holding*, "
+        "not day-trading — a sign of real accumulation. Enter NSE symbols "
+        "(comma-separated) to check."
+    )
+    try:
+        dv_all, dv_date = fetch_delivery()
+        default_syms = "RELIANCE, HDFCBANK, NIFTYBEES, TCS, INFY"
+        syms_txt = st.text_input(
+            "NSE symbols", value=default_syms, key="deliv_syms",
+            help="Equity or ETF symbols, e.g. RELIANCE, NIFTYBEES.",
+        )
+        wanted = [t.strip().upper().replace(".NS", "")
+                  for t in syms_txt.split(",") if t.strip()]
+        sub = dv_all[dv_all["SYMBOL"].str.upper().isin(wanted)].copy()
+        st.caption(f"Bhavcopy dated **{dv_date}** (latest available).")
+        if sub.empty:
+            st.info("None of those symbols found in the latest bhavcopy "
+                    "(check spelling; ETFs like NIFTYBEES work).")
+        else:
+            sub = sub.rename(columns={
+                "SYMBOL": "Symbol", "CLOSE_PRICE": "Close",
+                "TTL_TRD_QNTY": "Traded qty", "DELIV_QTY": "Delivered qty",
+                "DELIV_PER": "Delivery %"})
+            st.dataframe(
+                sub.sort_values("Delivery %", ascending=False),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "Close": st.column_config.NumberColumn("Close", format="%.2f"),
+                    "Traded qty": st.column_config.NumberColumn(
+                        "Traded qty", format="%d"),
+                    "Delivered qty": st.column_config.NumberColumn(
+                        "Delivered qty", format="%d"),
+                    "Delivery %": st.column_config.ProgressColumn(
+                        "Delivery %", min_value=0, max_value=100, format="%.1f%%"),
+                },
+            )
+        with st.expander("🏆 Top delivery % across NSE (liquid names)"):
+            liquid = dv_all[dv_all["TTL_TRD_QNTY"] > 100000].copy()
+            top = liquid.sort_values("DELIV_PER", ascending=False).head(25).rename(
+                columns={"SYMBOL": "Symbol", "CLOSE_PRICE": "Close",
+                         "DELIV_PER": "Delivery %"})
+            st.dataframe(
+                top[["Symbol", "Close", "Delivery %"]],
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "Close": st.column_config.NumberColumn("Close", format="%.2f"),
+                    "Delivery %": st.column_config.ProgressColumn(
+                        "Delivery %", min_value=0, max_value=100, format="%.1f%%"),
+                },
+            )
+    except Exception as exc:
+        st.warning(f"⚠️ Couldn't load delivery data right now: {exc}")
+
+    st.caption(
+        "**How to read it:** FII/DII net positive + bulk/block *buys* from fund "
+        "houses + high delivery % on the same names = strong institutional "
+        "accumulation. Persistent net selling + low delivery = money leaving "
+        "(pair with the Distribution score on the Sector Lifecycle tab). "
+        "Educational info, not investment advice."
+    )
+
+with tab_trigger:
+    st.subheader("⚡ Breakout Trigger — readiness vs imminence")
+    st.caption(
+        "The **Breakout Candidates** tab ranks by **readiness** — how *well-formed* "
+        "the coiled base is (MACD@0, tight squeeze, positive RS, above the 200-DMA). "
+        "But a textbook base can sit coiled for **weeks**. This tab adds a separate "
+        "**Imminence / trigger score** that measures whether the spring is actually "
+        "*releasing right now*: price pushing the **breakout line**, **volume "
+        "expanding**, **ADX ticking up**, the **squeeze firing** (bandwidth expanding) "
+        "and the **MACD histogram** growing off zero. A name is only **actionable now** "
+        "when it is **ready AND firing** — a high readiness score with low imminence "
+        "means *'good base, no trigger — watchlist'*, not *'buy today'*."
+    )
+    st.info(
+        f"⏱️ Scores use the active timeframe **{tf_choice}** (set in the sidebar). "
+        "**Readiness** = setup quality (the old breakout score). **Imminence** = is it "
+        "firing now. Rows are sorted by **Imminence** (most imminent first)."
+    )
+
+    if not scan_ready:
+        st.info("Run a scan from the sidebar to populate the trigger view.")
+    else:
+        def _verdict(readiness, imm):
+            if readiness < 45:
+                return "⚪ No setup"
+            if readiness >= 55 and imm >= 55:
+                return "🟢 BUY — ready + firing"
+            if readiness >= 55 and imm >= 35:
+                return "🟡 Almost — trigger building"
+            if readiness >= 55:
+                return "⏳ Watchlist — ready, no trigger"
+            if imm >= 55:
+                return "🔶 Moving — base still thin"
+            return "😴 Coiling — wait"
+
+        def _imm_color(imm):
+            if imm >= 75:
+                return "#1e7d46"
+            if imm >= 55:
+                return "#3f7d46"
+            if imm >= 35:
+                return "#b3952f"
+            return "#5a5f64"
+
+        for mkt in selected_markets:
+            pool = [s for m, s in results if m == mkt]
+            if not pool:
+                st.info(f"No {mkt} sectors scanned yet.")
+                continue
+
+            rows, firing = [], []
+            for s in pool:
+                parts = s.imminence_parts or {}
+                verdict = _verdict(s.breakout_score, s.imminence)
+                rows.append({
+                    "_imm": s.imminence,
+                    "_color": _imm_color(s.imminence),
+                    "Ticker": tradingview_url(s.ticker),
+                    "Symbol": s.ticker,
+                    "Sector": s.name,
+                    "Readiness": s.breakout_score,
+                    "Imminence": s.imminence,
+                    "Imm 1w ago": s.imminence_1w_ago,
+                    "Trigger": s.imminence_label,
+                    "% to line": s.dist_to_breakout_pct,
+                    "Box pos": s.range_position,
+                    "Range": parts.get("range_position"),
+                    "Volume": parts.get("volume_thrust"),
+                    "ADX↑": parts.get("adx_rising"),
+                    "Squeeze": parts.get("squeeze_firing"),
+                    "MACD": parts.get("macd_hist"),
+                    "Verdict": verdict,
+                })
+                if s.breakout_score >= 55 and s.imminence >= 55:
+                    firing.append(s)
+
+            trig_df = (pd.DataFrame(rows)
+                       .sort_values(["_imm", "Readiness"], ascending=[False, False])
+                       .reset_index(drop=True))
+
+            st.markdown(f"### {mkt} market")
+
+            if firing:
+                firing.sort(key=lambda x: x.imminence, reverse=True)
+                picks = " · ".join(
+                    f"**{s.ticker}** ({s.name}, readiness {s.breakout_score:.0f}, "
+                    f"imminence {s.imminence:.0f})"
+                    for s in firing[:8]
+                )
+                st.success(f"🟢 **Ready AND firing — actionable now:** {picks}")
+            else:
+                # Surface the ITB-type case: well-formed bases with no trigger.
+                waiting = sorted(
+                    [s for s in pool if s.breakout_score >= 58 and s.imminence < 35],
+                    key=lambda x: x.breakout_score, reverse=True)
+                if waiting:
+                    wp = " · ".join(
+                        f"**{s.ticker}** (readiness {s.breakout_score:.0f}, "
+                        f"{s.dist_to_breakout_pct:+.1f}% to line)"
+                        for s in waiting[:8] if s.dist_to_breakout_pct is not None)
+                    st.warning(
+                        "⏳ **Ready but no trigger yet — high-quality bases that are "
+                        f"*coiling*, not firing (watchlist):** {wp}"
+                    )
+                else:
+                    st.caption("No breakout firing right now — wait for a trigger.")
+
+            def _trig_color(row):
+                c = row["_color"]
+                style = (f"background-color: {c}; color: #ffffff; font-weight: 600"
+                         if c else "")
+                return [style] * len(row)
+
+            styler = trig_df.style.apply(_trig_color, axis=1)
+            st.dataframe(
+                styler, use_container_width=True, hide_index=True,
+                column_config={
+                    "_imm": None, "_color": None,
+                    "Ticker": st.column_config.LinkColumn(
+                        "Ticker", display_text=r"symbol=(.+)$"),
+                    "Readiness": st.column_config.ProgressColumn(
+                        "Readiness", help="Setup quality — how well-formed the base is "
+                        "(the original breakout score)", min_value=0, max_value=100,
+                        format="%d"),
+                    "Imminence": st.column_config.ProgressColumn(
+                        "Imminence", help="Is the breakout firing NOW — price at line, "
+                        "volume expanding, ADX rising, squeeze firing, MACD growing",
+                        min_value=0, max_value=100, format="%d"),
+                    "Imm 1w ago": st.column_config.NumberColumn(
+                        "Imm 1w ago", help="Imminence/trigger score as of ~1 week ago "
+                        "— compare with today's Imminence to see if the trigger is "
+                        "building (rising) or fading (falling)", format="%d"),
+                    "% to line": st.column_config.NumberColumn(
+                        "% to line", help="Distance from price to the breakout line "
+                        "(20-bar high). + = still below it, − = already above",
+                        format="%.1f%%"),
+                    "Box pos": st.column_config.NumberColumn(
+                        "Box pos", help="Where price sits in its range (0 = bottom, "
+                        "1 = top of the box)", format="%.2f"),
+                    "Range": st.column_config.NumberColumn(
+                        "Range", help="Range-position sub-score (near line = high)",
+                        format="%d"),
+                    "Volume": st.column_config.NumberColumn(
+                        "Volume", help="Volume-thrust sub-score (expanding = high)",
+                        format="%d"),
+                    "ADX↑": st.column_config.NumberColumn(
+                        "ADX↑", help="ADX-rising sub-score (trend waking = high)",
+                        format="%d"),
+                    "Squeeze": st.column_config.NumberColumn(
+                        "Squeeze", help="Squeeze-firing sub-score (bandwidth expanding "
+                        "= high; still contracting = 0)", format="%d"),
+                    "MACD": st.column_config.NumberColumn(
+                        "MACD", help="MACD-histogram sub-score (positive & expanding "
+                        "= high)", format="%d"),
+                },
+            )
+            st.download_button(
+                "⬇️ Download trigger CSV",
+                trig_df.drop(columns=["_imm", "_color"]).to_csv(index=False).encode(),
+                file_name=f"breakout_trigger_{mkt}.csv", mime="text/csv",
+                key=f"trig_dl_{mkt}",
+            )
+        st.caption(
+            "**Why this tab exists:** the top *readiness* name can stay #1 for weeks "
+            "while it quietly coils (e.g. price sitting mid-range, ADX falling, squeeze "
+            "still tightening). **Imminence** separates *'well-formed base'* from "
+            "*'breaking out now'* so the actionable pick is the one actually firing — "
+                "not merely the one with the prettiest base. **Imm 1w ago** shows the "
+                "trigger score a week back — compare it with today's Imminence to see if "
+                "the trigger is **building** (rising) or **fading** (falling). Educational "
+                "info, not investment advice."
+        )
 
 with tab_life:
     st.subheader("🔄 Sector Lifecycle — basing → breakout → stretched → distribution")
