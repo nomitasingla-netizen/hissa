@@ -35,12 +35,12 @@ from . import indicators as ind
 from . import patterns as pat
 
 # Canonical timeframes the engine can score (short → long).
-TIMEFRAMES = ("4h", "1d", "1wk")
+TIMEFRAMES = ("1h", "2h", "4h", "1d", "1wk")
 # Preference order for the "primary" timeframe used for targets/consolidation.
-PRIMARY_ORDER = ("1d", "1wk", "4h")
+PRIMARY_ORDER = ("1d", "1wk", "4h", "2h", "1h")
 
 # Blend weights between timeframes (normalised across whichever are selected).
-TIMEFRAME_WEIGHTS = {"4h": 0.4, "1d": 0.6, "1wk": 0.5}
+TIMEFRAME_WEIGHTS = {"1h": 0.2, "2h": 0.3, "4h": 0.4, "1d": 0.6, "1wk": 0.5}
 
 # Weights for breakout sub-scores (sum need not be 1; normalised internally).
 # Breakout sub-scores as a 100-point checklist (weights == points / 100):
@@ -104,7 +104,7 @@ IMMINENCE_WEIGHTS = {
     "volume_thrust": 0.25,    # recent volume expanding through ~1.3x+
     "adx_rising": 0.15,       # ADX ticking up (trend waking, not dying)
     "squeeze_firing": 0.15,   # Bollinger bandwidth expanding off a tight squeeze
-    "macd_hist": 0.15,        # MACD histogram positive and expanding off zero
+    "avwap": 0.15,            # price above / reclaiming the base's anchored VWAP
 }
 
 
@@ -180,6 +180,16 @@ def score_timeframe(df: pd.DataFrame, bench_df: pd.DataFrame | None) -> Timefram
     vol_recent = volume.tail(5).mean()
     vol_base = volume.tail(25).head(20).mean()
     vol_ratio = (vol_recent / vol_base) if vol_base else 1.0
+
+    # Anchored VWAP — anchored at the swing low of the recent base (the lowest
+    # low over a ~90-bar lookback). Price holding above it means every buyer
+    # since the base low is in profit / in control, a bullish breakout trigger.
+    avwap_lookback = min(len(df), 90)
+    window_low = low.iloc[-avwap_lookback:]
+    anchor_idx = len(df) - avwap_lookback + int(np.argmin(window_low.values))
+    avwap_series = ind.anchored_vwap(high, low, close, volume, anchor_idx)
+    avwap_v = float(avwap_series.iloc[-1])
+    avwap_dist_pct = ((price - avwap_v) / avwap_v * 100) if avwap_v > 0 else None
 
     # ---------------- Breakout sub-scores (100-point checklist) ----------------
     # MACD near zero and turning up  (30 pts).
@@ -357,6 +367,8 @@ def score_timeframe(df: pd.DataFrame, bench_df: pd.DataFrame | None) -> Timefram
         "rel_strength_pct": round(float(rel_str), 2),
         "vol_ratio": round(float(vol_ratio), 2),
         "avg_vol": round(float(vol_base), 0) if vol_base else None,
+        "avwap": round(avwap_v, 2) if avwap_v > 0 else None,
+        "avwap_dist_pct": round(float(avwap_dist_pct), 2) if avwap_dist_pct is not None else None,
         "cmf": round(cmf_v, 3),
         "mfi": round(mfi_v, 1),
         "dist_days": dist_days,
@@ -420,16 +432,18 @@ class SectorScore:
     patterns: dict = field(default_factory=dict)
     breakout_1w_ago: float | None = None
     breakout_2w_ago: float | None = None
+    st_mtf: dict = field(default_factory=dict)
 
 
 # Bars ≈ two weeks per timeframe for the score trend (10 trading days on 1D;
-# ~2 four-hour bars per session × 10 sessions on 4h).
-TREND_LOOKBACK = {"1d": 10, "4h": 20, "1wk": 4}
+# ~2 four-hour bars per session × 10 sessions on 4h). Intraday counts assume
+# ~7 one-hour bars per US session.
+TREND_LOOKBACK = {"1h": 70, "2h": 35, "4h": 20, "1d": 10, "1wk": 4}
 
 # Per-timeframe bar counts for looking the score back 1 and 2 weeks.
 HORIZON_LOOKBACK = {
-    "1w": {"1d": 5, "4h": 10, "1wk": 1},
-    "2w": {"1d": 10, "4h": 20, "1wk": 2},
+    "1w": {"1h": 35, "2h": 17, "4h": 10, "1d": 5, "1wk": 1},
+    "2w": {"1h": 70, "2h": 35, "4h": 20, "1d": 10, "1wk": 2},
 }
 
 
@@ -716,7 +730,7 @@ def imminence_score(raw: dict, targets: dict, consolidation: dict) -> dict:
       * volume_thrust  — recent volume expanding through ~1.3x+
       * adx_rising     — ADX ticking up (trend waking, not dying)
       * squeeze_firing — Bollinger bandwidth expanding off a tight squeeze
-      * macd_hist      — MACD histogram positive and expanding off zero
+      * avwap          — price holding above / reclaiming the base's anchored VWAP
 
     Returns {score, parts, label, note, color, dist_to_breakout_pct,
     range_position} — an empty-ish dict when data is missing.
@@ -769,22 +783,22 @@ def imminence_score(raw: dict, targets: dict, consolidation: dict) -> dict:
     else:
         squeeze_score = 50.0
 
-    # ---- 5) MACD histogram positive and expanding off zero ----
-    hist = raw.get("hist_pct")
-    hist_prev = raw.get("hist_prev_pct")
-    macd_score = 50.0
-    if hist is not None and hist_prev is not None:
-        macd_score = 50.0
-        macd_score += 25 if hist > 0 else -25
-        macd_score += 25 if hist > hist_prev else -25
-        macd_score = _clamp(macd_score)
+    # ---- 5) Anchored VWAP: price above / reclaiming the base's AVWAP ----
+    # Above the base's anchored VWAP => every buyer since the base low is in
+    # profit and in control (bullish). +3.3% above => 100, at AVWAP => 50,
+    # −3.3% below => 0.
+    avwap_dist = raw.get("avwap_dist_pct")
+    if avwap_dist is not None:
+        avwap_score = _clamp(50 + avwap_dist * 15)
+    else:
+        avwap_score = 50.0
 
     parts = {
         "range_position": round(range_pos_score, 1),
         "volume_thrust": round(vol_score, 1),
         "adx_rising": round(adx_score, 1),
         "squeeze_firing": round(squeeze_score, 1),
-        "macd_hist": round(macd_score, 1),
+        "avwap": round(avwap_score, 1),
     }
     score = round(_weighted(parts, IMMINENCE_WEIGHTS), 1)
 
@@ -1164,3 +1178,120 @@ def score_snapshot(
         return score_sector(ticker, name, past, bench_frames, timeframes)
     except Exception:
         return None
+
+
+# ===========================================================================
+# MTF Supertrend reversal score
+# ---------------------------------------------------------------------------
+# Lower timeframes flip *before* the higher (anchor) timeframe, so a pending
+# reversal of the anchor trend shows up as a bottom-up cascade of lower-TF
+# Supertrend flips. The score blends that weighted cascade with how close the
+# anchor's own close sits to its Supertrend flip line (in ATRs). Higher score =
+# the anchor trend is more likely to REVERSE soon.
+# ===========================================================================
+
+# combo label -> timeframes (ascending); the LAST entry is the anchor trend.
+ST_COMBOS = {
+    "1h+2h+4h": ["1h", "2h", "4h"],
+    "1h+2h+4h+1d": ["1h", "2h", "4h", "1d"],
+    "1h+2h+4h+1d+1w": ["1h", "2h", "4h", "1d", "1wk"],
+}
+
+# Leading weight of each timeframe: a flip on a bigger TF is a stronger lead.
+ST_TF_WEIGHT = {"1h": 1.0, "2h": 2.0, "4h": 3.0, "1d": 4.0, "1wk": 5.0}
+
+# Bars ≈ 1 / 2 weeks per timeframe for the historical (1w/2w ago) scores.
+ST_LOOKBACK = {
+    "1w": {"1h": 35, "2h": 17, "4h": 10, "1d": 5, "1wk": 1},
+    "2w": {"1h": 70, "2h": 35, "4h": 20, "1d": 10, "1wk": 2},
+}
+
+_ST_PERIOD = 10
+_ST_MULT = 3.0
+
+
+def _st_state(df: pd.DataFrame) -> dict | None:
+    """Current Supertrend state of one timeframe: direction (+1/-1), distance to
+    the flip line in ATRs, and the flip (line) price. None if not computable."""
+    if df is None or len(df) < _ST_PERIOD + 5:
+        return None
+    if not {"High", "Low", "Close"}.issubset(df.columns):
+        return None
+    line, direction = ind.supertrend(df["High"], df["Low"], df["Close"],
+                                     _ST_PERIOD, _ST_MULT)
+    d = direction.iloc[-1]
+    if pd.isna(d):
+        return None
+    close = float(df["Close"].iloc[-1])
+    ln = float(line.iloc[-1])
+    atr_series = ind.atr(df["High"], df["Low"], df["Close"], _ST_PERIOD)
+    atr_last = float(atr_series.iloc[-1]) if not atr_series.empty else float("nan")
+    dist_atr = abs(close - ln) / atr_last if atr_last and not math.isnan(atr_last) else None
+    return {"dir": int(d), "dist_atr": dist_atr, "flip_price": ln, "close": close}
+
+
+def supertrend_reversal(frames: dict, tfs: list[str]) -> dict | None:
+    """Reversal-probability score for one timeframe stack ``tfs`` (ascending;
+    last = anchor). Returns a dict with score (0-100, higher = reversal more
+    likely), the anchor trend, the flip target, the MTF stack string and the
+    anchor distance-to-flip in ATRs — or None if the anchor can't be scored."""
+    states: dict[str, dict] = {}
+    for tf in tfs:
+        s = _st_state(frames.get(tf, pd.DataFrame()))
+        if s is not None:
+            states[tf] = s
+    if not tfs:
+        return None
+    anchor = tfs[-1]
+    if anchor not in states:
+        return None
+
+    anchor_dir = states[anchor]["dir"]
+    lowers = tfs[:-1]
+
+    # Weighted fraction of lower TFs that have already flipped OPPOSITE to the
+    # anchor — the leading edge of a bottom-up reversal cascade.
+    tot_w = sum(ST_TF_WEIGHT.get(tf, 1.0) for tf in lowers if tf in states)
+    flipped_w = sum(ST_TF_WEIGHT.get(tf, 1.0) for tf in lowers
+                    if tf in states and states[tf]["dir"] != anchor_dir)
+    cascade = (flipped_w / tot_w) if tot_w else 0.0
+
+    # How ripe the anchor itself is: close within a few ATRs of its flip line.
+    da = states[anchor]["dist_atr"]
+    prox = 0.0 if da is None else max(0.0, 1.0 - da / 3.0)
+
+    score = round(100.0 * (0.65 * cascade + 0.35 * prox))
+
+    stack = "".join("🟢" if states[tf]["dir"] > 0 else "🔴"
+                    for tf in tfs if tf in states)
+    trend = "🟢 Bull" if anchor_dir > 0 else "🔴 Bear"
+    reversal_to = "🔴 → Bear" if anchor_dir > 0 else "🟢 → Bull"
+
+    return {
+        "score": float(score),
+        "trend": trend,
+        "reversal_to": reversal_to,
+        "stack": stack,
+        "dist_atr": da,
+        "flip_price": states[anchor]["flip_price"],
+        "anchor": anchor,
+    }
+
+
+def mtf_supertrend_all(frames: dict) -> dict:
+    """Compute the reversal score for every combo in ``ST_COMBOS`` plus the same
+    score 1 and 2 weeks ago (frames trimmed by ``ST_LOOKBACK`` bars). Returns
+    ``{combo_label: {score, trend, stack, dist_atr, score_1w, score_2w, ...}}``.
+    Combos whose anchor can't be scored map to None."""
+    out: dict = {}
+    for label, tfs in ST_COMBOS.items():
+        cur = supertrend_reversal(frames, tfs)
+        if cur is None:
+            out[label] = None
+            continue
+        past_1w = supertrend_reversal(_frames_back(frames, ST_LOOKBACK["1w"]), tfs)
+        past_2w = supertrend_reversal(_frames_back(frames, ST_LOOKBACK["2w"]), tfs)
+        cur["score_1w"] = past_1w["score"] if past_1w else None
+        cur["score_2w"] = past_2w["score"] if past_2w else None
+        out[label] = cur
+    return out

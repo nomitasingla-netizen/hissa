@@ -15,7 +15,7 @@ from core.data import fetch_ohlcv, truncate_frames, get_fund_info
 import core.etfs as etfs
 import core.stocks as stocks
 from core.etfs import MARKETS, LOAD_ERRORS
-from core.scoring import score_sector, breakout_snapshot, imminence_snapshot, score_snapshot, lifecycle_stage, PRIMARY_ORDER
+from core.scoring import score_sector, breakout_snapshot, imminence_snapshot, score_snapshot, lifecycle_stage, PRIMARY_ORDER, mtf_supertrend_all, ST_COMBOS
 from core.patterns import detect_breakout_retest
 import core.ipos as ipos
 import core.alerts as alertmod
@@ -109,10 +109,13 @@ selected_markets = ["US", "India"] if market_choice == "Both" else [market_choic
 tf_choice = st.sidebar.radio(
     "Timeframe",
     ["Blend (4h + 1D)", "Blend (4h + 1D + 1W)", "Blend (1D + 1W)",
-     "1D only", "4h only", "1W only"],
+     "1D only", "4h only", "1W only",
+     "MTF 1h+2h+4h", "MTF 1h+2h+4h+1D", "MTF 1h+2h+4h+1D+1W"],
     index=0,
     help="Which timeframe(s) the breakout/exit scores are based on. "
-         "1W (weekly) captures the higher-timeframe trend.",
+         "1W (weekly) captures the higher-timeframe trend. The **MTF** stacks add "
+         "intraday 1h/2h bars — they re-score *every* tab on those timeframes and "
+         "drive the Supertrend-reversal anchor (the largest timeframe in the stack).",
 )
 TF_MAP = {
     "Blend (4h + 1D)": ("4h", "1d"),
@@ -121,8 +124,20 @@ TF_MAP = {
     "1D only": ("1d",),
     "4h only": ("4h",),
     "1W only": ("1wk",),
+    "MTF 1h+2h+4h": ("1h", "2h", "4h"),
+    "MTF 1h+2h+4h+1D": ("1h", "2h", "4h", "1d"),
+    "MTF 1h+2h+4h+1D+1W": ("1h", "2h", "4h", "1d", "1wk"),
 }
 selected_tf = TF_MAP[tf_choice]
+
+# Which Supertrend-reversal combo (ST_COMBOS key) a selected timeframe maps to.
+# MTF stacks map 1:1; the classic blends fall back to a sensible default so the
+# Supertrend tab always has an anchor.
+ST_STACK_MAP = {
+    ("1h", "2h", "4h"): "1h+2h+4h",
+    ("1h", "2h", "4h", "1d"): "1h+2h+4h+1d",
+    ("1h", "2h", "4h", "1d", "1wk"): "1h+2h+4h+1d+1w",
+}
 
 # Optional 'as-of' date for backtesting / validating a past setup.
 import datetime as _dt
@@ -270,6 +285,7 @@ def run_scan(markets: list[str], lists: dict[str, dict], timeframes: tuple,
                 ticker, name, frames, bench_frames, timeframes, "2w")
             score.imminence_1w_ago = imminence_snapshot(
                 ticker, name, frames, bench_frames, timeframes, "1w")
+            score.st_mtf = mtf_supertrend_all(frames)
             results.append((mkt, score))
         except Exception as exc:  # keep scanning even if one ticker fails
             st.warning(f"Failed to score {ticker}: {exc}")
@@ -360,7 +376,10 @@ def build_score_df(scored: list, with_aum: bool) -> pd.DataFrame:
                 "Symbol": s.ticker,
                 "Sector": s.name,
                 "AUM": aum_str,
+                "Score": round(0.6 * s.breakout_score + 0.4 * s.imminence, 1),
                 "Breakout": s.breakout_score,
+                "Imminence": s.imminence,
+                "Trigger": s.imminence_label,
                 "HNI flow": s.accumulation_score,
                 "Vol score": s.volume_score,
                 "1W ago": s.breakout_1w_ago,
@@ -499,8 +518,21 @@ def render_table(frame):
     cfg = {
         "Ticker": TICKER_LINK,
         "_delta": None,  # hide helper column
+        "Score": st.column_config.ProgressColumn(
+            "Score", help="Combined breakout score = 60% readiness (base quality) + "
+            "40% imminence (is it firing NOW). This is the ranking column — it lifts "
+            "candidates that are actually triggering above pretty-but-dormant bases",
+            min_value=0, max_value=100, format="%d"
+        ),
         "Breakout": st.column_config.ProgressColumn(
-            "Breakout", min_value=0, max_value=100, format="%d"
+            "Breakout", help="Readiness — how well-formed the base is (setup quality)",
+            min_value=0, max_value=100, format="%d"
+        ),
+        "Imminence": st.column_config.ProgressColumn(
+            "Imminence", help="Is the breakout firing NOW — price at the line, volume "
+            "expanding, ADX rising, squeeze firing, and price above the base's "
+            "anchored VWAP. A high readiness with low imminence is still just coiling",
+            min_value=0, max_value=100, format="%d"
         ),
         "HNI flow": st.column_config.ProgressColumn(
             "HNI flow", help="Smart-money / HNI accumulation proxy — how strongly "
@@ -538,6 +570,61 @@ CCY_SYM = {"US": "$", "India": "₹"}
 # More capital is queued at lower prices so a falling ETF lowers your average
 # cost. Shares sum to 1.0; the blended fill price is ~2% below market.
 SIP_LADDER = [(0.00, 0.40), (-0.02, 0.30), (-0.04, 0.20), (-0.06, 0.10)]
+
+
+def todays_sip_entry(sc, price, held_qty, held_pct, recently_bought,
+                     cash=0.0, sym="$"):
+    """Decide whether — and at what laddered prices — to SIP into one candidate
+    *today*, accounting for the breakout trigger (imminence), how much you
+    already hold, and whether you just bought it.
+
+    ``sc`` is a SectorScore; ``held_qty`` / ``held_pct`` come from the uploaded
+    positions; ``recently_bought`` is True when the order history shows a buy
+    inside the current bar. Returns a row dict for the SIP-entry table.
+    """
+    b = sc.breakout_score or 0
+    e = sc.exit_score or 0
+    imm = sc.imminence if sc.imminence is not None else 0
+
+    # How much of today's chunk to actually place, and the action label.
+    if not price or price <= 0:
+        action, size = "⬜ No price", 0.0
+    elif e >= 50:
+        action, size = "⚠️ Extended — book, don't add", 0.0
+    elif recently_bought:
+        action, size = "✋ Just bought — skip today", 0.0
+    elif held_pct is not None and held_pct >= 0.20:
+        # Already a core-sized position — only top up on the lower dip rungs.
+        action, size = "🟢 Core holding — add on dips only", 0.5
+    elif imm >= 55 and b >= 45:
+        action, size = "🟢 BUY today — trigger firing", 1.0
+    elif imm >= 40 and b >= 45:
+        action, size = "🟢 BUY small — trigger building", 0.5
+    elif b >= 45:
+        action, size = "⏳ WAIT — coiling, no trigger", 0.0
+    else:
+        action, size = "⬜ Not a SIP candidate", 0.0
+
+    # Build the laddered limit prices for the rungs we intend to place. When
+    # sizing at 0.5 we skip the market rung and queue only the dip rungs.
+    rungs = SIP_LADDER if size >= 1.0 else SIP_LADDER[1:] if size > 0 else []
+    rung_prices = [round(price * (1 + off), 2) for off, _ in rungs] if price else []
+    entries = " / ".join(f"{sym}{p:,.2f}" for p in rung_prices) if rung_prices else "—"
+
+    chunk = round(cash * size, 2) if cash else None
+    units = None
+    if chunk and price and rung_prices:
+        # Rough total units if every intended rung fills, weighted by the ladder.
+        wsum = sum(w for _, w in rungs) or 1.0
+        units = int(sum((chunk * (w / wsum)) // rp
+                        for (_, w), rp in zip(rungs, rung_prices)))
+
+    return {
+        "action": action,
+        "entries": entries,
+        "chunk": chunk,
+        "units": units,
+    }
 
 
 def _pos_num(x):
@@ -617,6 +704,21 @@ def score_holding_cached(ticker: str, market: str, timeframes: tuple):
     snap_1w = score_snapshot(ticker, ticker, frames, bench, timeframes, "1w")
     imm_1w = snap_1w.imminence if snap_1w else None
     exit_imm_1w = snap_1w.exit_imminence if snap_1w else None
+    # ---- MTF Supertrend reversal read (same model as the Supertrend tab) ----
+    # The selected timeframe picks the ST combo; classic blends fall back to the
+    # 1D-anchored stack (the more reliable reversal anchor per backtest).
+    st_combo = ST_STACK_MAP.get(tuple(timeframes), "1h+2h+4h+1d")
+    st_cur = (mtf_supertrend_all(frames) or {}).get(st_combo) or {}
+    # ---- 10-day EMA proximity (for SIP entry sizing) ----
+    ema10 = ema10_dist = None
+    d1 = frames.get("1d")
+    if d1 is not None and not d1.empty and "Close" in d1.columns and len(d1) >= 10:
+        e10 = d1["Close"].ewm(span=10, adjust=False).mean()
+        if not e10.empty:
+            ema10 = float(e10.iloc[-1])
+            px = float(d1["Close"].iloc[-1])
+            if ema10:
+                ema10_dist = round((px / ema10 - 1) * 100, 2)
     return {
         "exit_score": s.exit_score,
         "breakout": s.breakout_score,
@@ -644,6 +746,19 @@ def score_holding_cached(ticker: str, market: str, timeframes: tuple):
         "exit_imminence_label": s.exit_imminence_label,
         "exit_imminence_note": s.exit_imminence_note,
         "exit_imminence_1w_ago": exit_imm_1w,
+        # ---- MTF Supertrend reversal fields ----
+        "st_combo": st_combo,
+        "st_trend": st_cur.get("trend"),
+        "st_reversal": st_cur.get("score"),
+        "st_reversal_to": st_cur.get("reversal_to"),
+        "st_stack": st_cur.get("stack"),
+        "st_flip_price": st_cur.get("flip_price"),
+        "st_dist_atr": st_cur.get("dist_atr"),
+        "st_reversal_1w": st_cur.get("score_1w"),
+        "st_anchor": st_cur.get("anchor"),
+        # ---- 10-day EMA (SIP entry proximity) ----
+        "ema10": ema10,
+        "ema10_dist_pct": ema10_dist,
     }
 
 
@@ -804,6 +919,73 @@ def daily_action(sc):
                 "pct": 0, "act_price": price, "day_target": t1 or price}
     return {"side": "hold", "label": "⚪ HOLD — do nothing",
             "pct": 0, "act_price": price, "day_target": t1 or price}
+
+
+def apply_supertrend(act, sc):
+    """Overlay the MTF Supertrend reversal read on a two-sided action.
+
+    The Supertrend anchor is the largest timeframe in the selected stack. Its
+    direction plus the reversal score (0-100, higher = a flip is more likely
+    soon) refine the add/trim/exit call:
+
+      * **Bull anchor + high reversal score** → topping risk → escalate to a
+        TRIM (or withhold an ADD) even if the breakout metrics still look fine.
+      * **Bear anchor already flipped down** → the long-trend stop is hit →
+        EXIT (the anchor Supertrend line is the trailing stop).
+      * **Bear anchor + very high reversal score** → a bull flip is imminent
+        (the backtest's highest-edge long trigger) → convert a would-be
+        exit/hold into a small anticipatory starter ADD, unless a breakdown is
+        actively firing.
+
+    Returns (act, note). ``act`` is unchanged when Supertrend adds nothing.
+    """
+    trend = sc.get("st_trend")
+    rev = sc.get("st_reversal")
+    if trend is None or rev is None:
+        return act, None
+    is_bull = "Bull" in trend
+    price = sc.get("price")
+    flip = sc.get("st_flip_price")
+    side = act["side"]
+
+    if is_bull:
+        # Uptrend intact — only a strongly firing reversal should override.
+        if rev >= 75 and side in ("hold", "add"):
+            return ({"side": "trim",
+                     "label": "🟠 TRIM — ST topping (reversal imminent)",
+                     "pct": 33, "act_price": price,
+                     "day_target": sc.get("target1")},
+                    f"MTF Supertrend still Bull but reversal score {rev:.0f} — high "
+                    "flip risk; trim into strength.")
+        if rev >= 75 and side == "trim":
+            return ({**act, "pct": max(act.get("pct", 0), 50),
+                     "label": "🔴 TRIM more — ST topping"},
+                    f"Supertrend reversal score {rev:.0f} reinforces the trim.")
+        if rev >= 60 and side == "add":
+            return ({"side": "hold",
+                     "label": "⏳ HOLD — ST reversal pressure building",
+                     "pct": 0, "act_price": price,
+                     "day_target": sc.get("target1")},
+                    f"Add withheld — Supertrend reversal score {rev:.0f} is rising.")
+        return act, None
+
+    # ---- Bearish anchor: the long-trend Supertrend has flipped down ----
+    xi = sc.get("exit_imminence") or 0
+    if rev >= 65 and side in ("hold", "exit") and xi < 55:
+        return ({"side": "add",
+                 "label": "🟢 ADD starter — ST bull flip imminent",
+                 "pct": 8,
+                 "act_price": round(price * 0.99, 2) if price else price,
+                 "day_target": sc.get("target1")},
+                f"Supertrend Bear but reversal score {rev:.0f} — bull flip imminent; "
+                "anticipatory starter only.")
+    if side in ("hold", "add"):
+        return ({"side": "exit",
+                 "label": "🔴 EXIT — ST flipped bearish (trend stop)",
+                 "pct": 100, "act_price": price, "day_target": flip or price},
+                "MTF Supertrend anchor is Bearish — trend stop hit"
+                + (f" (flip line {flip:.2f})." if flip else "."))
+    return act, None
 
 
 def breakout_watch(sc, days_waited, patience_days):
@@ -1035,12 +1217,459 @@ def _days_held(hist) -> int:
 
 
 SHOW_SIP_TAB = False  # SIP & Exit Plan tab hidden; flip to True to restore it
-tab_exit, tab_trigger, tab1, tab2, tab3, tab_rate, tab_life, tab_flows, tab4, tab5, tab6, tab7, tab_alerts = st.tabs(
-    ["🎯 Exit plan — your holdings", "⚡ Breakout Trigger",
+tab_swp, tab_st, tab_exit, tab_trigger, tab1, tab2, tab3, tab_rate, tab_life, tab_flows, tab4, tab5, tab6, tab7, tab_alerts = st.tabs(
+    ["🏧 SWP Exit — Supertrend", "🔀 Supertrend Reversal",
+     "🎯 Exit plan — your holdings", "⚡ Breakout Trigger",
      "🚀 Breakout Candidates", "💰 Allocation", "🔴 Exit Watch", "⭐ Rate My List",
      "🔄 Sector Lifecycle", "🏦 Institutional Flows", "🔎 Details", "🔁 52W-High Retest",
      "🆕 NSE IPOs near launch", "🎯 Near-Zero MACD Coil", "🔔 Alerts"]
 )
+
+with tab_swp:
+    # ===== SWP Exit — mirror of the Supertrend SIP-entry logic =====
+    st.markdown("### 🏧 SWP Exit — systematic withdrawal on Supertrend reversal")
+    st.info(
+        f"⏱️ **Active stack: {tf_choice}** — the exit is scored on the MTF Supertrend "
+        "reversal of the timeframe stack selected in the sidebar (anchor = the largest "
+        "timeframe in the stack). Switch to an **MTF** stack for a true multi-timeframe "
+        "read."
+    )
+    st.caption(
+        "The **mirror of the Supertrend SIP entry**: on the entry side you SIP most "
+        "when the trend is **Bullish and the reversal score is low** (uptrend firmly "
+        "intact). Here, on the **exit** side, you run a **SWP (systematic withdrawal)** "
+        "when the trend is **Bearish and the reversal score is low** — a downtrend "
+        "firmly locked in with little chance of a near-term bounce. The withdrawal % "
+        "is largest at the lowest scores and tapers to *Hold* as the score rises (a "
+        "bull flip becomes more likely). A **Bullish** holding with a **very high** "
+        "score (a top building) also starts a smaller, anticipatory SWP. Upload the "
+        "**same** positions / order-history files as the Exit-plan tab."
+    )
+
+    swp_downloads_dir = Path(os.environ.get("SCANNER_DOWNLOADS_DIR", Path.home() / "Downloads"))
+
+    swp_up = st.file_uploader("Upload positions CSV", type=["csv"], key="swp_pos_upload")
+    swp_sample_files = {"— none —": None}
+    if swp_downloads_dir.is_dir():
+        for fp in sorted(swp_downloads_dir.glob("*.csv")):
+            swp_sample_files[fp.name] = str(fp)
+    swp_sample_choice = st.selectbox(
+        f"…or load a CSV from your Downloads folder ({swp_downloads_dir})",
+        list(swp_sample_files.keys()), index=0, key="swp_pos_sample")
+
+    st.markdown("**➕ Order history (optional)** — avoids re-selling what you just sold")
+    swp_order_ups = st.file_uploader(
+        "Upload order history (tradebook / transactions)",
+        type=["csv", "xlsx", "xls"], accept_multiple_files=True, key="swp_orders_upload")
+    swp_hist_pick_files = {}
+    if swp_downloads_dir.is_dir():
+        for fp in sorted(list(swp_downloads_dir.glob("*.csv")) + list(swp_downloads_dir.glob("*.xlsx"))):
+            swp_hist_pick_files[fp.name] = str(fp)
+    swp_hist_picks = st.multiselect(
+        "…or pick order-history files from Downloads",
+        list(swp_hist_pick_files.keys()), key="swp_orders_pick")
+
+    def _st_swp_exit(trend, score):
+        """Exit / SWP guidance — the mirror of the Supertrend SIP entry.
+
+        * **Bearish** anchor trend + **low** reversal score = downtrend firmly
+          intact, little near-term bounce → withdraw the largest tranche; the %
+          tapers as the score rises (a bull flip grows more likely), then Hold.
+        * **Bullish** anchor trend + **very high** reversal score = a top is
+          building → start a smaller, anticipatory SWP that scales with the score.
+
+        Returns ``{'pct': int, 'label': str}``."""
+        if score is None:
+            return {"pct": 0, "label": "—"}
+        is_bull = isinstance(trend, str) and "Bull" in trend
+        if not is_bull:
+            if score < 20:
+                return {"pct": 30, "label": "🔴 Strong SWP — downtrend locked"}
+            if score < 40:
+                return {"pct": 20, "label": "🔴 SWP — downtrend"}
+            if score < 55:
+                return {"pct": 10, "label": "🟠 Light SWP — weak trend"}
+            return {"pct": 0, "label": "⏸️ Hold — bull flip building"}
+        # Bullish anchor — a high reversal score = top building → begin exiting.
+        if score >= 80:
+            return {"pct": 20, "label": "🔴 Reversal SWP — top imminent"}
+        if score >= 65:
+            return {"pct": 12, "label": "🟠 Starter SWP — top building"}
+        if score >= 55:
+            return {"pct": 6, "label": "🟡 Early trim — topping early"}
+        return {"pct": 0, "label": "🟢 Hold — uptrend intact"}
+
+    swp_raw = None
+    if swp_up is not None:
+        swp_raw = swp_up.getvalue().decode("utf-8", errors="ignore")
+    elif swp_sample_files.get(swp_sample_choice):
+        try:
+            with open(swp_sample_files[swp_sample_choice], "r", encoding="utf-8", errors="ignore") as fh:
+                swp_raw = fh.read()
+        except Exception as exc:
+            st.error(f"Couldn't read the file: {exc}")
+
+    if not swp_raw:
+        st.info("👆 Upload a positions CSV (or pick a Downloads sample) to see the SWP exit plan.")
+    else:
+        # ---- Order-history enrichment (optional) ----
+        swp_orders_all, swp_srcs = [], []
+        for f in (swp_order_ups or []):
+            try:
+                o, ofmt = parse_orders_bytes(f.getvalue(), f.name)
+            except Exception:
+                o, ofmt = [], None
+            if o:
+                swp_orders_all += o
+                swp_srcs.append(f"{f.name} ({ofmt}, {len(o)})")
+        for nm in (swp_hist_picks or []):
+            path = swp_hist_pick_files.get(nm)
+            if not path:
+                continue
+            try:
+                with open(path, "rb") as fh:
+                    o, ofmt = parse_orders_bytes(fh.read(), nm)
+            except Exception:
+                o, ofmt = [], None
+            if o:
+                swp_orders_all += o
+                swp_srcs.append(f"{nm} ({ofmt}, {len(o)})")
+        swp_orders_summary = summarize_orders(swp_orders_all) if swp_orders_all else {}
+        if swp_orders_summary:
+            st.caption(
+                f"📗 Order history loaded: {len(swp_orders_all)} trades across "
+                f"{len(swp_orders_summary)} symbols — {', '.join(swp_srcs)}.")
+
+        swp_positions, swp_fmt = parse_positions_text(swp_raw)
+        if not swp_positions:
+            st.error(
+                "Couldn't recognise this CSV. Expected a Schwab positions export "
+                "(has 'Symbol' + 'Asset Type') or a Zerodha holdings export "
+                "(has 'Instrument' + 'LTP')."
+            )
+        else:
+            st.caption(f"Detected **{swp_fmt.upper()}** format — {len(swp_positions)} holdings.")
+
+            # ---- Investable cash per market (for the SIP-entry side) ----
+            swp_markets = sorted({p["market"] for p in swp_positions})
+            swp_cash = {}
+            _ccols = st.columns(max(len(swp_markets), 1))
+            for _i, _mk in enumerate(swp_markets):
+                with _ccols[_i]:
+                    swp_cash[_mk] = st.number_input(
+                        f"💵 Investable cash to SIP ({_mk}, {CCY_SYM.get(_mk, '')})",
+                        min_value=0.0, value=0.0, step=1000.0,
+                        key=f"swp_sip_cash_{_mk}",
+                        help="Cash to deploy into your BULLISH holdings that have a LOW "
+                        "reversal score. It is spread across sectors (diversified), "
+                        "tilted toward names trading near/below their 10-day EMA, and "
+                        "trimmed for names you already bought this bar.")
+
+            swp_rows = []
+            sip_candidates = []
+            with st.spinner("Scoring your holdings on the Supertrend reversal…"):
+                for p in swp_positions:
+                    try:
+                        sc = score_holding_cached(p["yf"], p["market"], tuple(selected_tf))
+                    except Exception:
+                        sc = None
+                    sym = CCY_SYM.get(p["market"], "")
+                    if sc is None:
+                        swp_rows.append({
+                            "_amt": -1.0, "_color": "",
+                            "Ticker": tradingview_url(p["yf"]), "Symbol": p["symbol"],
+                            "Market": p["market"], "Qty": p["qty"],
+                            "Trend": "❔", "Reversal Score": None,
+                            "SWP action": "❔ No data", "SWP %": 0,
+                            "Shares to sell": None, f"Value freed {sym}": None,
+                        })
+                        continue
+                    trend = sc.get("st_trend")
+                    score = sc.get("st_reversal")
+                    price = sc.get("price") or p.get("ltp")
+                    qty = p.get("qty") or 0
+                    swp = _st_swp_exit(trend, score)
+
+                    # Order-history guard: don't re-sell what you already sold this
+                    # bar. Reuse the quantity-aware dedup from the Exit-plan tab.
+                    hist = swp_orders_summary.get(f"{p['market']}:{p['symbol']}")
+                    held_days = _days_held(hist)
+                    act = {"side": "trim" if swp["pct"] > 0 else "hold",
+                           "label": swp["label"], "pct": swp["pct"],
+                           "act_price": price, "day_target": None}
+                    act, hist_note = apply_order_history(act, hist, selected_tf, qty)
+                    final_pct = act["pct"] if act["side"] != "hold" else 0
+                    action_label = act["label"] if act["side"] != "hold" else swp["label"]
+                    if act["side"] == "hold" and swp["pct"] > 0:
+                        action_label = act["label"]  # downgraded by history
+
+                    shares = int(round(qty * final_pct / 100)) if qty else None
+                    value = round(shares * price, 2) if (shares and price) else None
+                    # Deeper red for a bigger withdrawal.
+                    color = ("#7f1d1d" if final_pct >= 25 else
+                             "#b91c1c" if final_pct >= 15 else
+                             "#c2410c" if final_pct >= 6 else "")
+
+                    # ---- SIP-entry candidacy: Bullish + LOW reversal score ----
+                    is_bull = isinstance(trend, str) and "Bull" in trend
+                    if is_bull and score is not None and score < 55 and price:
+                        tier_w, tier_lbl = ((1.0, "🟢 Strong") if score < 20 else
+                                            (0.66, "🟢 SIP") if score < 40 else
+                                            (0.33, "🟡 Light"))
+                        ema_dist = sc.get("ema10_dist_pct")
+                        # Reward pullbacks toward/below the 10-day EMA; fade extension.
+                        if ema_dist is None:
+                            ema_f = 1.0
+                        elif ema_dist <= 0:
+                            ema_f = 1.25
+                        elif ema_dist <= 2:
+                            ema_f = 1.0
+                        elif ema_dist <= 5:
+                            ema_f = 0.7
+                        else:
+                            ema_f = 0.4
+                        # Freshness — down-weight a name you already bought this bar.
+                        recent_buy = False
+                        _ld = hist.get("last_date") if hist else None
+                        if (hist and hist.get("last_side") == "buy"
+                                and _ld is not None and pd.notna(_ld)):
+                            _ds = (pd.Timestamp.now(tz=None).normalize()
+                                   - pd.Timestamp(_ld).normalize()).days
+                            recent_buy = _ds <= _bar_window_days(selected_tf)
+                        fresh_f = 0.5 if recent_buy else 1.0
+                        sip_candidates.append({
+                            "yf": p["yf"], "Symbol": p["symbol"], "Market": p["market"],
+                            "price": price, "score": score, "ema_dist": ema_dist,
+                            "existing_value": round((qty or 0) * price, 2),
+                            "weight": tier_w * ema_f * fresh_f,
+                            "tier": tier_lbl, "fresh": not recent_buy,
+                        })
+
+                    swp_rows.append({
+                        "_amt": float(value) if value else 0.0,
+                        "_color": color,
+                        "Ticker": tradingview_url(p["yf"]),
+                        "Symbol": p["symbol"],
+                        "Market": p["market"],
+                        "Qty": qty,
+                        "Held days": held_days,
+                        "Gain %": p.get("gain_pct"),
+                        "Trend": trend,
+                        "Reversal Score": score,
+                        "Score 1w ago": sc.get("st_reversal_1w"),
+                        "SWP action": action_label,
+                        "SWP %": final_pct,
+                        "Shares to sell": shares,
+                        f"Value freed {sym}": value,
+                        "Price": price,
+                        "ST flip/stop": sc.get("st_flip_price"),
+                        "History note": hist_note or None,
+                    })
+
+            if not swp_rows:
+                st.info("No holdings could be scored yet.")
+            else:
+                # Currency of the majority market (for the headline banner).
+                mkts = [r["Market"] for r in swp_rows]
+                hsym = CCY_SYM.get(max(set(mkts), key=mkts.count), "")
+                total = sum(r["_amt"] for r in swp_rows if r["_amt"] > 0)
+                n_exit = sum(1 for r in swp_rows if r["SWP %"] > 0)
+                if n_exit:
+                    top_bits = " · ".join(
+                        f"**{r['Symbol']}** {r['SWP action']} "
+                        f"({CCY_SYM.get(r['Market'],'')}{r['_amt']:,.0f})"
+                        for r in sorted(swp_rows, key=lambda x: x["_amt"], reverse=True)[:6]
+                        if r["_amt"] > 0)
+                    st.error(
+                        f"🔻 **SWP now — withdraw ~{hsym}{total:,.0f} across "
+                        f"{n_exit} holding(s):** {top_bits}")
+                else:
+                    st.success(
+                        "✅ No SWP exits right now — no holding is in a locked "
+                        "downtrend or topping on this stack.")
+
+                swp_df = (pd.DataFrame(swp_rows)
+                          .sort_values(["_amt", "Reversal Score"],
+                                       ascending=[False, True])
+                          .reset_index(drop=True))
+
+                def _swp_row_color(row):
+                    c = row["_color"]
+                    style = (f"background-color: {c}; color: #ffffff; font-weight: 600"
+                             if c else "")
+                    return [style] * len(row)
+
+                styler = swp_df.style.apply(_swp_row_color, axis=1)
+                st.dataframe(
+                    styler, use_container_width=True, hide_index=True,
+                    column_config={
+                        "_amt": None, "_color": None,
+                        "Ticker": st.column_config.LinkColumn(
+                            "Ticker", display_text=r"symbol=(.+)$"),
+                        "Gain %": st.column_config.NumberColumn("Gain %", format="%.1f%%"),
+                        "Trend": st.column_config.TextColumn(
+                            "Trend", help="Current Supertrend direction of the anchor "
+                            "(largest) timeframe in the selected stack"),
+                        "Reversal Score": st.column_config.ProgressColumn(
+                            "Reversal Score", help="0–100. On the exit side a Bearish "
+                            "trend with a LOW score = downtrend locked (SWP hardest); "
+                            "a Bullish trend with a HIGH score = topping (start SWP)",
+                            min_value=0, max_value=100, format="%d"),
+                        "Score 1w ago": st.column_config.NumberColumn(
+                            "Score 1w ago", help="Reversal score ~1 week ago", format="%d"),
+                        "SWP %": st.column_config.NumberColumn(
+                            "SWP %", help="% of this holding to withdraw now", format="%d%%"),
+                        "ST flip/stop": st.column_config.NumberColumn(
+                            "ST flip/stop", help="Anchor Supertrend line — the level "
+                            "price must reclaim to flip bullish (a close back above it "
+                            "stops the SWP)", format="%.2f"),
+                        "Price": st.column_config.NumberColumn("Price", format="%.2f"),
+                    },
+                )
+                st.download_button(
+                    "⬇️ Download SWP exit plan",
+                    swp_df.drop(columns=["_amt", "_color"]).to_csv(index=False).encode(),
+                    file_name=f"swp_exit_{'-'.join(selected_tf)}.csv", mime="text/csv",
+                    key="swp_dl")
+                st.caption(
+                    "**SWP %** scales with how *locked* the reversal is: a Bearish "
+                    "holding withdraws 30/20/10% as the score sits below 20/40/55, then "
+                    "Holds once ≥55 (a bull flip is building). A Bullish holding starts "
+                    "a 6/12/20% SWP as the score climbs through 55/65/80 (a top "
+                    "building). **Shares to sell** = SWP % × quantity; rows are ordered "
+                    "by **Value freed**, largest exit first. Order history nets down or "
+                    "cancels a tranche you've already sold this bar. Educational "
+                    "info, not investment advice."
+                )
+
+                # ================= SIP deployment (entry side) =================
+                st.divider()
+                st.markdown(
+                    "#### 💧 SIP deployment — bullish sectors with a low reversal score")
+                if not any((swp_cash.get(m) or 0) > 0 for m in swp_markets):
+                    st.caption(
+                        "Enter investable cash above to get a **diversified** SIP plan: "
+                        "cash is split across your bullish, low-reversal-score holdings "
+                        "(different sectors), tilted toward names near/below their "
+                        "10-day EMA, and reduced for names you already bought this bar.")
+                else:
+                    for _mk in swp_markets:
+                        cash = swp_cash.get(_mk) or 0.0
+                        if cash <= 0:
+                            continue
+                        msym = CCY_SYM.get(_mk, "")
+                        cands = [c for c in sip_candidates
+                                 if c["Market"] == _mk and c["price"]]
+                        if not cands:
+                            st.info(
+                                f"**{_mk}:** no bullish holding with a low reversal "
+                                "score to SIP into right now.")
+                            continue
+                        # Diversified (equal-weight) + conviction (score/EMA/freshness)
+                        # allocation, water-filled under a per-name cap so the cash
+                        # spreads across sectors instead of piling into one name.
+                        n = len(cands)
+                        tot_w = sum(c["weight"] for c in cands) or 1.0
+                        fracs = {id(c): 0.5 / n + 0.5 * c["weight"] / tot_w
+                                 for c in cands}
+                        cap = max(0.40, 1.0 / n)
+                        for _ in range(12):
+                            excess = 0.0
+                            under = []
+                            for c in cands:
+                                k = id(c)
+                                if fracs[k] > cap + 1e-9:
+                                    excess += fracs[k] - cap
+                                    fracs[k] = cap
+                                else:
+                                    under.append(c)
+                            if excess <= 1e-9 or not under:
+                                break
+                            tu = sum(fracs[id(c)] for c in under) or 1.0
+                            for c in under:
+                                fracs[id(c)] += excess * fracs[id(c)] / tu
+
+                        sip_rows = []
+                        for c in cands:
+                            alloc = cash * fracs[id(c)]
+                            sh = int(alloc // c["price"]) if c["price"] else 0
+                            spend = round(sh * c["price"], 2)
+                            add_pct = (round(spend / c["existing_value"] * 100, 1)
+                                       if c.get("existing_value") else None)
+                            sip_rows.append({
+                                "_spend": spend,
+                                "Ticker": tradingview_url(c["yf"]),
+                                "Symbol": c["Symbol"],
+                                "Reversal Score": c["score"],
+                                "10-EMA dist %": c["ema_dist"],
+                                "SIP tier": c["tier"] + ("" if c["fresh"]
+                                                         else " · recent buy"),
+                                f"Existing {msym}": c.get("existing_value"),
+                                "Add %": add_pct,
+                                "Buy shares": sh,
+                                f"Deploy {msym}": spend,
+                                "Price": c["price"],
+                            })
+                        deployed = sum(r["_spend"] for r in sip_rows)
+                        n_dep = sum(1 for r in sip_rows if r["_spend"] > 0)
+                        top = " · ".join(
+                            f"**{r['Symbol']}** {msym}{r['_spend']:,.0f}"
+                            for r in sorted(sip_rows, key=lambda x: x["_spend"],
+                                            reverse=True)[:6] if r["_spend"] > 0)
+                        if n_dep:
+                            st.success(
+                                f"💧 **{_mk} — SIP {msym}{deployed:,.0f} of "
+                                f"{msym}{cash:,.0f} ({deployed / cash * 100:.0f}%) "
+                                f"across {n_dep} sector(s):** {top}")
+                        else:
+                            st.info(
+                                f"**{_mk}:** cash too small to buy a full share of any "
+                                "candidate at current prices.")
+                        sip_df = (pd.DataFrame(sip_rows)
+                                  .sort_values("_spend", ascending=False)
+                                  .drop(columns=["_spend"]).reset_index(drop=True))
+                        st.dataframe(
+                            sip_df, use_container_width=True, hide_index=True,
+                            column_config={
+                                "Ticker": st.column_config.LinkColumn(
+                                    "Ticker", display_text=r"symbol=(.+)$"),
+                                "Reversal Score": st.column_config.ProgressColumn(
+                                    "Reversal Score", help="Lower = uptrend more firmly "
+                                    "intact → larger SIP tilt", min_value=0,
+                                    max_value=100, format="%d"),
+                                "10-EMA dist %": st.column_config.NumberColumn(
+                                    "10-EMA dist %", help="Price vs the 10-day EMA. "
+                                    "≤ 0 = at/below the EMA (best pullback entry, "
+                                    "boosted); the more extended above it, the smaller "
+                                    "the SIP.", format="%.2f%%"),
+                                "Add %": st.column_config.NumberColumn(
+                                    "Add %", help="Deploy amount as a % of your existing "
+                                    "position value in this name", format="%.1f%%"),
+                                f"Deploy {msym}": st.column_config.NumberColumn(
+                                    f"Deploy {msym}", help="Cash to deploy into this "
+                                    "name now", format="%.0f"),
+                                f"Existing {msym}": st.column_config.NumberColumn(
+                                    f"Existing {msym}", format="%.0f"),
+                                "Price": st.column_config.NumberColumn("Price", format="%.2f"),
+                            },
+                        )
+                        st.download_button(
+                            f"⬇️ Download {_mk} SIP plan",
+                            sip_df.to_csv(index=False).encode(),
+                            file_name=f"swp_sip_{_mk}_{'-'.join(selected_tf)}.csv",
+                            mime="text/csv", key=f"swp_sip_dl_{_mk}")
+                    st.caption(
+                        "**How the SIP is sized:** each bullish holding with a reversal "
+                        "score < 55 gets a base weight (Strong < 20, SIP < 40, Light "
+                        "< 55), multiplied by a **10-day EMA** factor (×1.25 at/below "
+                        "the EMA, fading to ×0.4 when > 5% extended) and a **freshness** "
+                        "factor (×0.5 if already bought this bar). Cash is then split "
+                        "**50% equally across sectors** (diversification) and **50% by "
+                        "conviction**, capped per name so no single sector hogs the "
+                        "deployment. **Add %** = deploy ÷ your existing position. "
+                        "Educational info, not investment advice."
+                    )
+
 
 with tab_exit:
     # ============ SECTION B — Exit plan for uploaded positions ============
@@ -1188,6 +1817,8 @@ with tab_exit:
                                "pct": 25, "act_price": price,
                                "day_target": sc.get("target1")}
                     act, hist_note = apply_order_history(act, hist, selected_tf, qty)
+                    # ---- MTF Supertrend overlay (trend stop + reversal timing) ----
+                    act, st_note = apply_supertrend(act, sc)
                     a_price = act["act_price"] or price
                     shares = int(round(qty * act["pct"] / 100)) if qty else None
                     if act["side"] == "add":
@@ -1218,6 +1849,11 @@ with tab_exit:
                         "Breakdown": sc.get("exit_imminence_label"),
                         "Breakdown score": sc.get("exit_imminence"),
                         "Bkdn 1w ago": sc.get("exit_imminence_1w_ago"),
+                        "ST trend": sc.get("st_trend"),
+                        "ST reversal": sc.get("st_reversal"),
+                        "ST rev 1w": sc.get("st_reversal_1w"),
+                        "ST flip/stop": sc.get("st_flip_price"),
+                        "ST signal": st_note,
                         f"Cash Δ {sym}": cash_delta,
                         "Held days": held_days,
                         "Trades": n_trades,
@@ -1245,6 +1881,9 @@ with tab_exit:
                         "Breakout above": bw["trigger"],
                         "Breakout watch": bw["status"],
                         f"Frees {sym}": free_val,
+                        "ST trend": sc.get("st_trend"),
+                        "ST reversal": sc.get("st_reversal"),
+                        "ST stop (flip)": sc.get("st_flip_price"),
                         "T1 (scale ~40%)": sc.get("target1"),
                         "T1 %": sc.get("target1_pct"),
                         "T2 (runner)": sc.get("target"),
@@ -1293,7 +1932,15 @@ with tab_exit:
                 "EXIT** scales with whether a *top is actually firing now* — an "
                 "extended-but-still-trending winner is trimmed lightly (or held to "
                 "let it run), and only a real roll-over is cut hard. **Cash Δ** "
-                "is negative when you deploy cash, positive when you free it."
+                "is negative when you deploy cash, positive when you free it. "
+                "**ST trend / ST reversal / ST flip-stop** apply the MTF Supertrend "
+                "model: the anchor is the largest timeframe in the selected stack. A "
+                "**Bull** holding with a high **ST reversal** score is topping — the "
+                "overlay escalates a hold/add into a TRIM; once the anchor actually "
+                "flips **Bear**, the **ST flip/stop** line is the trailing-stop EXIT. "
+                "A **Bear** holding with a very high reversal score (imminent bull "
+                "flip — the backtest's best long trigger) becomes a small anticipatory "
+                "starter ADD. **ST signal** explains any such override."
                 + (" **Held days / Trades / History note** come from your order "
                    "history — a repeat ADD (just bought) or repeat TRIM (just sold) "
                    "is held back to HOLD this bar; a true over-extended EXIT still "
@@ -1331,6 +1978,25 @@ with tab_exit:
                         "Bkdn 1w ago", help="Breakdown-trigger score ~1 week ago — "
                         "compare with Breakdown score to see if the roll-over is "
                         "building or easing", format="%d"),
+                    "ST reversal": st.column_config.ProgressColumn(
+                        "ST reversal", help="MTF Supertrend reversal score (0–100). "
+                        "Higher = the anchor trend (largest TF in the selected stack) "
+                        "is more likely to flip soon. A BULL holding with a high score "
+                        "is topping (trim); a BEAR holding with a high score is a "
+                        "bull flip imminent (starter add).", min_value=0, max_value=100,
+                        format="%d"),
+                    "ST rev 1w": st.column_config.NumberColumn(
+                        "ST rev 1w", help="Supertrend reversal score ~1 week ago — "
+                        "compare with ST reversal to see if flip pressure is building",
+                        format="%d"),
+                    "ST flip/stop": st.column_config.NumberColumn(
+                        "ST flip/stop", help="The anchor Supertrend line. In a BULL "
+                        "trend it is the trailing stop (exit on a close below it); in "
+                        "a BEAR trend it is the level price must reclaim to flip "
+                        "bullish.", format="%.2f"),
+                    "ST signal": st.column_config.TextColumn(
+                        "ST signal", help="How the Supertrend overlay changed the call "
+                        "(topping trim, trend-stop exit, or bull-flip starter add)"),
                     "Exit score": st.column_config.ProgressColumn(
                         "Exit score", min_value=0, max_value=100, format="%d"),
                 },
@@ -1389,6 +2055,14 @@ with tab_exit:
                     "Exit %": st.column_config.NumberColumn("Exit %", format="%d%%"),
                     "T1 %": st.column_config.NumberColumn("T1 %", format="%.1f%%"),
                     "Gain %": st.column_config.NumberColumn("Gain %", format="%.1f%%"),
+                    "ST reversal": st.column_config.ProgressColumn(
+                        "ST reversal", help="MTF Supertrend reversal score (0–100). "
+                        "Higher = the anchor trend is closer to flipping.",
+                        min_value=0, max_value=100, format="%d"),
+                    "ST stop (flip)": st.column_config.NumberColumn(
+                        "ST stop (flip)", help="Anchor Supertrend line — the trailing "
+                        "stop while the trend is Bull (exit on a close below it).",
+                        format="%.2f"),
                 },
             )
             st.download_button(
@@ -1415,19 +2089,377 @@ if not scan_ready:
     st.stop()
 
 
+with tab_st:
+    st.subheader("🔀 Supertrend Reversal — MTF trend-reversal probability")
+    st.caption(
+        "Lower timeframes flip **before** the higher one, so a pending reversal of "
+        "the anchor trend shows up as a **bottom-up cascade** of Supertrend flips. "
+        "The **Reversal Score** (0–100) blends that weighted cascade with how close "
+        "the anchor's price sits to its own Supertrend flip line (in ATRs). "
+        "**Higher = the current trend is more likely to reverse soon.** The **Trend** "
+        "column is the anchor timeframe's *current* Supertrend direction; **Stack** "
+        "shows each timeframe's direction (🟢 up / 🔴 down), smallest→largest. "
+        "**SIP action / % / amount**: deploy when the setup favours an uptrend — a "
+        "**bullish** anchor trend with a **low** reversal score (uptrend intact), *or* "
+        "a **bearish** trend with a **very high** reversal score (bull flip imminent → "
+        "smaller anticipatory starter SIP). Set your **investable cash** below each "
+        "market — rows are ordered by entry size (largest SIP first)."
+    )
+
+    st_combo = ST_STACK_MAP.get(tuple(selected_tf), "1h+2h+4h+1d")
+    anchor_tf = ST_COMBOS[st_combo][-1]
+    st.info(
+        f"⏱️ Timeframe stack **{st_combo}** — set it from the sidebar **Timeframe** "
+        f"control (pick an **MTF …** option). Predicting a reversal of the "
+        f"**{anchor_tf}** Supertrend (the largest timeframe in the stack) using the "
+        "lower-timeframe flip cascade + ATR proximity. **Score 1w / 2w ago** let you "
+        "see whether the reversal pressure is **building** (rising) or **fading** "
+        "(falling)."
+    )
+
+    def _st_color(score):
+        if score is None:
+            return ""
+        if score >= 70:
+            return "#1e7d46"
+        if score >= 50:
+            return "#3f7d46"
+        if score >= 30:
+            return "#b3952f"
+        return "#5a5f64"
+
+    def _st_sip_entry(trend, score):
+        """Entry / SIP guidance from the anchor trend + reversal score.
+
+        Two entry cases:
+        * **Bullish** anchor trend with a **low** reversal score = uptrend intact,
+          little near-term top risk → deploy the most cash; the % tapers as the
+          reversal score climbs, then stops (Hold).
+        * **Bearish** anchor trend with a **very high** reversal score = a bull
+          flip is imminent → start a (more conservative, anticipatory) SIP that
+          scales up with the score.
+
+        Returns ``{'pct': int, 'label': str}``."""
+        if score is None:
+            return {"pct": 0, "label": "—"}
+        is_bull = isinstance(trend, str) and "Bull" in trend
+        if is_bull:
+            if score < 20:
+                return {"pct": 30, "label": "🟢 Strong SIP"}
+            if score < 40:
+                return {"pct": 20, "label": "🟢 SIP"}
+            if score < 55:
+                return {"pct": 10, "label": "🟡 Light SIP"}
+            return {"pct": 0, "label": "⏸️ Hold — reversal risk"}
+        # Bearish anchor trend — a high reversal score = bull flip building.
+        if score >= 80:
+            return {"pct": 20, "label": "🟢 Reversal SIP — bull flip imminent"}
+        if score >= 65:
+            return {"pct": 12, "label": "🟡 Starter SIP — reversal building"}
+        if score >= 55:
+            return {"pct": 6, "label": "🟠 Early nibble — reversal early"}
+        return {"pct": 0, "label": "🚫 Avoid — downtrend"}
+
+    def _st_row_color(row):
+        c = row["_color"]
+        style = (f"background-color: {c}; color: #ffffff; font-weight: 600"
+                 if c else "")
+        return [style] * len(row)
+
+    st_colcfg = {
+        "_score": None, "_color": None, "_amt": None,
+        "Ticker": st.column_config.LinkColumn(
+            "Ticker", display_text=r"symbol=(.+)$"),
+        "Trend": st.column_config.TextColumn(
+            "Trend", help=f"Current Supertrend direction of the anchor "
+            f"({anchor_tf}) timeframe"),
+        "SIP action": st.column_config.TextColumn(
+            "SIP action", help="Entry guidance. Deploy when the setup favours "
+            "an uptrend: (a) a BULLISH anchor trend with a LOW reversal score "
+            "(uptrend intact) — size tapers as reversal risk rises, then Hold; "
+            "or (b) a BEARISH anchor trend with a VERY HIGH reversal score "
+            "(bull flip imminent) — a smaller, anticipatory starter SIP that "
+            "scales up with the score. Otherwise avoid."),
+        "SIP %": st.column_config.NumberColumn(
+            "SIP %", help="Suggested % of this market's investable cash to "
+            "deploy now", format="%d%%"),
+        "SIP amount": st.column_config.TextColumn(
+            "SIP amount", help="SIP % × investable cash."),
+        "Reversal Score": st.column_config.ProgressColumn(
+            "Reversal Score", help="0–100. Higher = the anchor trend is more "
+            "likely to reverse soon (weighted lower-TF flip cascade + ATR "
+            "proximity of the anchor to its own flip line)",
+            min_value=0, max_value=100, format="%d"),
+        "Score 1w ago": st.column_config.NumberColumn(
+            "Score 1w ago", help="Reversal score ~1 week ago — compare with "
+            "today to see if reversal pressure is building or fading",
+            format="%d"),
+        "Score 2w ago": st.column_config.NumberColumn(
+            "Score 2w ago", help="Reversal score ~2 weeks ago", format="%d"),
+        "Reversal to": st.column_config.TextColumn(
+            "Reversal to", help="Direction the trend would flip TO if it "
+            "reverses"),
+        "Stack": st.column_config.TextColumn(
+            "Stack", help="Per-timeframe Supertrend direction "
+            "(🟢 up / 🔴 down), ordered smallest→largest timeframe"),
+        "Dist-to-flip (ATR)": st.column_config.NumberColumn(
+            "Dist-to-flip (ATR)", help="How far the anchor's price is from its "
+            "Supertrend flip line, in ATRs. Smaller = riper for a flip",
+            format="%.2f"),
+    }
+
+    def _render_st_group(group_rows, title, caption, ascending, mkt, suffix):
+        st.markdown(f"#### {title}")
+        if not group_rows:
+            st.caption("_None in this group right now._")
+            return
+        if caption:
+            st.caption(caption)
+        gdf = (pd.DataFrame(group_rows)
+               .sort_values("_score", ascending=ascending)
+               .reset_index(drop=True))
+        styler = gdf.style.apply(_st_row_color, axis=1)
+        st.dataframe(styler, use_container_width=True, hide_index=True,
+                     column_config=st_colcfg)
+        st.download_button(
+            "⬇️ Download CSV",
+            gdf.drop(columns=["_score", "_color", "_amt"]).to_csv(index=False).encode(),
+            file_name=f"supertrend_reversal_{mkt}_{suffix}_{st_combo.replace('+', '-')}.csv",
+            mime="text/csv", key=f"st_dl_{mkt}_{suffix}",
+        )
+
+    for mkt in selected_markets:
+        pool = [s for m, s in results if m == mkt]
+        if not pool:
+            st.info(f"No {mkt} sectors scanned yet.")
+            continue
+
+        sym = CCY_SYM.get(mkt, "$")
+        st.markdown(f"### {mkt} market")
+        cash = st.number_input(
+            f"💵 Investable cash to deploy ({mkt}, {sym})",
+            min_value=0.0, value=100000.0, step=1000.0,
+            key=f"st_cash_{mkt}",
+            help="Cash available for this market. Each row's SIP % is applied to "
+            "this to size the entry, and rows are ordered by entry size (largest "
+            "first).",
+        )
+
+        rows, ripe = [], []
+        for s in pool:
+            data = (getattr(s, "st_mtf", {}) or {}).get(st_combo)
+            if not data:
+                continue
+            score = data.get("score")
+            da = data.get("dist_atr")
+            entry = _st_sip_entry(data.get("trend"), score)
+            amt = round(cash * entry["pct"] / 100.0)
+            rows.append({
+                "_score": score if score is not None else -1,
+                "_amt": amt,
+                "_color": _st_color(score),
+                "Ticker": tradingview_url(s.ticker),
+                "Symbol": s.ticker,
+                "Sector": s.name,
+                "Trend": data.get("trend"),
+                "SIP action": entry["label"],
+                "SIP %": entry["pct"],
+                "SIP amount": f"{sym}{amt:,.0f}" if entry["pct"] > 0 else "—",
+                "Reversal Score": score,
+                "Score 1w ago": data.get("score_1w"),
+                "Score 2w ago": data.get("score_2w"),
+                "Reversal to": data.get("reversal_to"),
+                "Stack": data.get("stack"),
+                "Dist-to-flip (ATR)": round(da, 2) if da is not None else None,
+            })
+            if score is not None and score >= 60 and "Bull" in (data.get("trend") or ""):
+                ripe.append((s, data))
+
+        if not rows:
+            st.info(f"No Supertrend data available for {mkt} yet.")
+            continue
+
+        deploy_total = sum(r["_amt"] for r in rows)
+        n_entries = sum(1 for r in rows if r["_amt"] > 0)
+        if n_entries:
+            top_bits = " · ".join(
+                f"**{r['Symbol']}** {r['SIP action']} {r['SIP amount']}"
+                for r in sorted(rows, key=lambda x: x["_amt"], reverse=True)[:6]
+                if r["_amt"] > 0
+            )
+            st.success(
+                f"💧 **SIP now — {sym}{deploy_total:,.0f} of {sym}{cash:,.0f} "
+                f"({(deploy_total / cash * 100) if cash else 0:.0f}% of cash) across "
+                f"{n_entries} name(s):** {top_bits}"
+            )
+        else:
+            st.caption("No names to SIP into right now on this stack.")
+
+        if ripe:
+            ripe.sort(key=lambda x: x[1]["score"], reverse=True)
+            picks = " · ".join(
+                f"**{s.ticker}** ({s.name}, score {d['score']:.0f}, {d['reversal_to']})"
+                for s, d in ripe[:8]
+            )
+            st.warning(
+                f"🔺 **Bullish names with high reversal pressure (topping — caution "
+                f"on adds):** {picks}"
+            )
+
+        # Split into two tables by current anchor trend.
+        bull_rows = [r for r in rows if "Bull" in (r["Trend"] or "")]
+        bear_rows = [r for r in rows if "Bull" not in (r["Trend"] or "")]
+        # Bullish → ascending by reversal score (lowest reversal risk / strongest
+        # SIP first). Bearish → descending (closest to a bull flip first).
+        _render_st_group(
+            bull_rows, f"🟢 Bullish trend ({len(bull_rows)})",
+            "Uptrend intact — sorted **ascending** by reversal score: lowest "
+            "reversal risk (strongest SIP) at the top.", True, mkt, "bull")
+        _render_st_group(
+            bear_rows, f"🔴 Bearish trend ({len(bear_rows)})",
+            "Downtrend — sorted **descending** by reversal score: closest to a bull "
+            "flip (best reversal SIP) at the top.", False, mkt, "bear")
+
+    st.caption(
+        "**How to read it:** a rising score across *Score 2w ago → 1w ago → now* means "
+        "the lower timeframes are flipping one-by-one against the anchor trend and the "
+        "anchor price is closing in on its Supertrend line — a reversal is building. "
+        "Use it as an **early lead** on daily/weekly Supertrend flips, then confirm on "
+        "the anchor timeframe itself. Educational info, not investment advice."
+    )
+
+
 with tab1:
-    st.subheader("Ranked by breakout readiness")
+    st.subheader("Ranked by breakout readiness + imminence")
     st.caption(
         "🟢 green = score rising fast (demand building / tightening) · "
-        "🔴 red = score falling fast · **Action** column suggests staged SIP / "
+        "🔴 red = score falling fast · **Score** = 60% readiness + 40% imminence "
+        "(is it firing now) · **Action** column suggests staged SIP / "
         "profit-booking · click a **Ticker** to open its TradingView chart."
     )
-    ranked = df.sort_values("Breakout", ascending=False).reset_index(drop=True)
+    ranked = (df.sort_values("Score", ascending=False).reset_index(drop=True)
+              if "Score" in df.columns else df)
     render_table(ranked)
     st.download_button(
         "⬇️ Download CSV",
-        ranked.drop(columns=["_delta"]).to_csv(index=False).encode(),
+        ranked.drop(columns=["_delta"], errors="ignore").to_csv(index=False).encode(),
         file_name="breakout_scan.csv", mime="text/csv",
+    )
+
+    # -------- Today's SIP entry plan (position- & history-aware) --------
+    st.divider()
+    st.markdown("#### 📅 Today's SIP entry plan (position- & history-aware)")
+    st.caption(
+        "Clear per-candidate **buy-today** calls: the laddered entry prices for "
+        "today, gated by the **breakout trigger** (imminence) and adjusted for what "
+        "you **already hold** and what you **just bought**. Upload your broker "
+        "**positions** and **transactions** CSVs (Schwab / Zerodha) — a name you "
+        "already added this bar shows *✋ Just bought — skip*, an already-core "
+        "position adds *on dips only*, and only names whose trigger is firing get a "
+        "full *🟢 BUY today* ladder."
+    )
+    sc1, sc2 = st.columns(2)
+    sip_pos_up = sc1.file_uploader(
+        "Positions CSV", type=["csv"], key="sip_pos_upload",
+        help="Your current holdings export — used to avoid over-adding to names you "
+        "already own a lot of.")
+    sip_ord_up = sc2.file_uploader(
+        "Transactions CSV", type=["csv", "xlsx", "xls"], key="sip_ord_upload",
+        help="Your order history — used to skip names you already bought this bar.")
+    sip_cash = st.number_input(
+        f"Cash to deploy per BUY name today ({CCY_SYM.get(selected_markets[0], '$') if selected_markets else '$'})",
+        min_value=0.0, value=0.0, step=500.0, key="sip_entry_cash",
+        help="Optional — sizes the ladder into approximate units per rung.")
+
+    sip_positions, sip_pos_lookup, sip_port_total = [], {}, 0.0
+    if sip_pos_up is not None:
+        try:
+            sip_positions, _ = parse_positions_text(sip_pos_up.getvalue().decode("utf-8", "ignore"))
+        except Exception:
+            sip_positions = []
+        for p in sip_positions:
+            val = (p.get("qty") or 0) * (p.get("ltp") or p.get("avg") or 0)
+            sip_port_total += val
+            sip_pos_lookup[(p["market"], p["symbol"])] = {"qty": p.get("qty"), "val": val}
+
+    sip_orders_sum = {}
+    if sip_ord_up is not None:
+        try:
+            _o, _f = parse_orders_bytes(sip_ord_up.getvalue(), sip_ord_up.name)
+            sip_orders_sum = summarize_orders(_o) if _o else {}
+        except Exception:
+            sip_orders_sum = {}
+
+    bar_days = _bar_window_days(selected_tf)
+    now_ts = pd.Timestamp.today().normalize()
+    sip_entry_rows = []
+    for mkt, s in sorted(results, key=lambda ms: 0.6 * ms[1].breakout_score + 0.4 * ms[1].imminence, reverse=True):
+        base_sym = s.ticker.replace(".NS", "").upper()
+        price = (s.targets or {}).get("entry")
+        pos = sip_pos_lookup.get((mkt, base_sym))
+        held_qty = pos["qty"] if pos else None
+        held_pct = (pos["val"] / sip_port_total) if (pos and sip_port_total) else None
+        osum = sip_orders_sum.get(f"{mkt}:{base_sym}")
+        recently_bought = False
+        if osum and osum.get("last_side") == "buy" and osum.get("last_date") is not None:
+            try:
+                recently_bought = (now_ts - pd.Timestamp(osum["last_date"]).normalize()).days <= bar_days
+            except Exception:
+                recently_bought = False
+        plan = todays_sip_entry(
+            s, price, held_qty, held_pct, recently_bought,
+            cash=sip_cash, sym=CCY_SYM.get(mkt, "$"))
+        sip_entry_rows.append({
+            "Ticker": tradingview_url(s.ticker),
+            "Symbol": s.ticker,
+            "Market": mkt,
+            "Score": round(0.6 * s.breakout_score + 0.4 * s.imminence, 1),
+            "Imminence": s.imminence,
+            "Trigger": s.imminence_label,
+            "Price": price,
+            "Held qty": held_qty,
+            "Held %": round(held_pct * 100, 1) if held_pct is not None else None,
+            "SIP action": plan["action"],
+            "Buy today @": plan["entries"],
+            f"Chunk": plan["chunk"],
+            "≈ Units": plan["units"],
+        })
+
+    sip_entry_df = pd.DataFrame(sip_entry_rows)
+    if sip_entry_df.empty:
+        st.info("No scanned candidates yet — run a scan from the sidebar to build "
+                "today's SIP entry plan.")
+    else:
+        # Surface the actionable BUY names first.
+        _buy = sip_entry_df[sip_entry_df["SIP action"].str.startswith("🟢")]
+        _other = sip_entry_df[~sip_entry_df["SIP action"].str.startswith("🟢")]
+        sip_entry_df = pd.concat([_buy, _other]).reset_index(drop=True)
+        if not sip_cash:
+            sip_entry_df = sip_entry_df.drop(columns=["Chunk", "≈ Units"])
+        st.dataframe(
+            sip_entry_df, use_container_width=True, hide_index=True,
+            column_config={
+                "Ticker": st.column_config.LinkColumn("Ticker", display_text=r"symbol=(.+)$"),
+                "Score": st.column_config.ProgressColumn(
+                    "Score", min_value=0, max_value=100, format="%d"),
+                "Imminence": st.column_config.ProgressColumn(
+                    "Imminence", min_value=0, max_value=100, format="%d"),
+                "Held %": st.column_config.NumberColumn(
+                    "Held %", help="This holding's share of your uploaded portfolio value",
+                    format="%.1f%%"),
+                "Buy today @": st.column_config.TextColumn(
+                    "Buy today @", help="Laddered limit prices to place today (market + dip "
+                    "rungs, or dip-only rungs when adding to a core position)"),
+            },
+        )
+    if not sip_positions and sip_pos_up is not None:
+        st.warning("Couldn't parse that positions CSV — expected a Schwab or Zerodha export.")
+    st.caption(
+        "**How to read it:** 🟢 = place the laddered limit orders shown under *Buy "
+        "today @* · ⏳ = base is coiling, wait for the trigger · ✋ = you already added "
+        "this bar · ⚠️ = extended, book don't add. Upload the **transactions** CSV to "
+        "enable the *just-bought* guard and the **positions** CSV for the *core "
+        "holding* / *Held %* awareness."
     )
 
     # -------- Score an uploaded watchlist (India stocks) --------
@@ -1456,7 +2488,7 @@ with tab1:
             f"{st.session_state.get('wl_count', len(wl_results))} watchlist symbols "
             "— ranked by breakout readiness.")
         wdf = build_score_df(wl_results, False).sort_values(
-            "Breakout", ascending=False).reset_index(drop=True)
+            "Score", ascending=False).reset_index(drop=True)
         render_table(wdf)
         st.download_button(
             "⬇️ Download watchlist scores CSV",
@@ -1855,7 +2887,7 @@ with tab_trigger:
                     "Volume": parts.get("volume_thrust"),
                     "ADX↑": parts.get("adx_rising"),
                     "Squeeze": parts.get("squeeze_firing"),
-                    "MACD": parts.get("macd_hist"),
+                    "AVWAP": parts.get("avwap"),
                     "Verdict": verdict,
                 })
                 if s.breakout_score >= 55 and s.imminence >= 55:
@@ -1936,9 +2968,10 @@ with tab_trigger:
                     "Squeeze": st.column_config.NumberColumn(
                         "Squeeze", help="Squeeze-firing sub-score (bandwidth expanding "
                         "= high; still contracting = 0)", format="%d"),
-                    "MACD": st.column_config.NumberColumn(
-                        "MACD", help="MACD-histogram sub-score (positive & expanding "
-                        "= high)", format="%d"),
+                    "AVWAP": st.column_config.NumberColumn(
+                        "AVWAP", help="Anchored-VWAP sub-score — price above the base's "
+                        "anchored VWAP (buyers since the base low in control) = high; "
+                        "below it = 0", format="%d"),
                 },
             )
             st.download_button(
@@ -2177,7 +3210,7 @@ with tab4:
             "Educational estimate, not advice."
         )
 
-    for key in ("1wk", "1d", "4h"):
+    for key in ("1wk", "1d", "4h", "2h", "1h"):
         if key not in s.tf:
             continue
         tfr = s.tf[key]

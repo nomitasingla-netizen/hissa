@@ -50,6 +50,52 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
+def supertrend(high: pd.Series, low: pd.Series, close: pd.Series,
+               period: int = 10, mult: float = 3.0):
+    """ATR Supertrend trailing stop.
+
+    Returns ``(line, direction)`` as Series:
+      * ``direction``  +1 = uptrend (line is support *below* price),
+                       -1 = downtrend (line is resistance *above* price).
+      * ``line``       the Supertrend value — in an uptrend it is the final
+                       lower band, in a downtrend the final upper band. This is
+                       exactly the close price that would trigger a flip, so
+                       ``|close - line| / ATR`` is the distance-to-reversal in
+                       ATRs.
+
+    Standard algorithm: basic bands ``hl2 ± mult*ATR`` are carried forward into
+    'final' bands that only ratchet in the trend's favour; direction flips when
+    close crosses the opposing final band.
+    """
+    atr_ = atr(high, low, close, period)
+    hl2 = (high + low) / 2.0
+    upper = (hl2 + mult * atr_).to_numpy()
+    lower = (hl2 - mult * atr_).to_numpy()
+    c = close.to_numpy()
+    n = len(c)
+
+    fu = np.full(n, np.nan)   # final upper band
+    fl = np.full(n, np.nan)   # final lower band
+    dir_ = np.full(n, 1.0)
+
+    for i in range(n):
+        if np.isnan(upper[i]) or np.isnan(lower[i]):
+            continue
+        if i == 0 or np.isnan(fu[i - 1]) or np.isnan(fl[i - 1]):
+            fu[i], fl[i], dir_[i] = upper[i], lower[i], 1.0
+            continue
+        fu[i] = upper[i] if (upper[i] < fu[i - 1] or c[i - 1] > fu[i - 1]) else fu[i - 1]
+        fl[i] = lower[i] if (lower[i] > fl[i - 1] or c[i - 1] < fl[i - 1]) else fl[i - 1]
+        if dir_[i - 1] > 0:
+            dir_[i] = -1.0 if c[i] < fl[i] else 1.0
+        else:
+            dir_[i] = 1.0 if c[i] > fu[i] else -1.0
+
+    line = np.where(dir_ > 0, fl, fu)
+    return (pd.Series(line, index=close.index),
+            pd.Series(dir_, index=close.index))
+
+
 def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14):
     """Return (adx, plus_di, minus_di) using Wilder's smoothing."""
     up_move = high.diff()
@@ -97,6 +143,26 @@ def obv(close: pd.Series, volume: pd.Series) -> pd.Series:
     OBV while price holds up warns of distribution."""
     direction = np.sign(close.diff().fillna(0.0))
     return (direction * volume).cumsum()
+
+
+def anchored_vwap(high: pd.Series, low: pd.Series, close: pd.Series,
+                  volume: pd.Series, anchor_idx: int) -> pd.Series:
+    """Anchored VWAP — the volume-weighted average price accumulated from a
+    fixed *anchor* bar (``anchor_idx``, a positional index) to the end of the
+    series, using the typical price (H+L+C)/3.
+
+    Anchored at the start / swing-low of a base, it is the average price every
+    buyer since that anchor has paid: while price holds **above** the anchored
+    VWAP those base-buyers are in profit and in control (bullish), and losing it
+    means the base is failing. The last value is the current AVWAP.
+    """
+    anchor_idx = max(0, min(anchor_idx, len(close) - 1))
+    tp = (high + low + close) / 3.0
+    tp = tp.iloc[anchor_idx:]
+    vol = volume.iloc[anchor_idx:]
+    cum_vol = vol.cumsum().replace(0, np.nan)
+    cum_pv = (tp * vol).cumsum()
+    return cum_pv / cum_vol
 
 
 def cmf(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series,
