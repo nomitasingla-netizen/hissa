@@ -34,8 +34,9 @@ def _drop_incomplete(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna(subset=price_cols)
 
 
-def _resample_4h(df_1h: pd.DataFrame) -> pd.DataFrame:
-    if df_1h.empty:
+def _resample_intraday(df_1h: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """Resample flattened 1h OHLCV bars to a coarser intraday bar (e.g. 2h/4h)."""
+    if df_1h is None or df_1h.empty:
         return df_1h
     agg = {
         "Open": "first",
@@ -45,17 +46,23 @@ def _resample_4h(df_1h: pd.DataFrame) -> pd.DataFrame:
         "Volume": "sum",
     }
     cols = {c: agg[c] for c in df_1h.columns if c in agg}
-    out = df_1h.resample("4h").agg(cols).dropna(how="any")
-    return out
+    return df_1h.resample(rule).agg(cols).dropna(how="any")
+
+
+def _resample_4h(df_1h: pd.DataFrame) -> pd.DataFrame:
+    return _resample_intraday(df_1h, "4h")
 
 
 def fetch_ohlcv(ticker: str) -> dict[str, pd.DataFrame]:
-    """Return {'4h': df, '1d': df, '1wk': df} of OHLCV data for a ticker.
+    """Return {'1h','2h','4h','1d','1wk'} of OHLCV data for a ticker.
 
-    Empty DataFrames are returned for any timeframe that fails to download.
+    yfinance has no native 2h/4h interval, so 1h bars are downloaded once and
+    resampled to 2h and 4h. Empty DataFrames are returned for any timeframe
+    that fails to download.
     """
     result: dict[str, pd.DataFrame] = {
-        "4h": pd.DataFrame(), "1d": pd.DataFrame(), "1wk": pd.DataFrame(),
+        "1h": pd.DataFrame(), "2h": pd.DataFrame(), "4h": pd.DataFrame(),
+        "1d": pd.DataFrame(), "1wk": pd.DataFrame(),
     }
 
     try:
@@ -72,7 +79,10 @@ def fetch_ohlcv(ticker: str) -> dict[str, pd.DataFrame]:
             ticker, period=_INTRADAY_PERIOD, interval="1h",
             auto_adjust=True, progress=False, threads=False,
         )
-        result["4h"] = _resample_4h(_drop_incomplete(_flatten(hourly)))
+        hourly = _drop_incomplete(_flatten(hourly))
+        result["1h"] = hourly
+        result["2h"] = _resample_intraday(hourly, "2h")
+        result["4h"] = _resample_intraday(hourly, "4h")
     except Exception:
         pass
 

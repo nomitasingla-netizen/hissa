@@ -35,12 +35,12 @@ from . import indicators as ind
 from . import patterns as pat
 
 # Canonical timeframes the engine can score (short → long).
-TIMEFRAMES = ("4h", "1d", "1wk")
+TIMEFRAMES = ("1h", "2h", "4h", "1d", "1wk")
 # Preference order for the "primary" timeframe used for targets/consolidation.
-PRIMARY_ORDER = ("1d", "1wk", "4h")
+PRIMARY_ORDER = ("1d", "1wk", "4h", "2h", "1h")
 
 # Blend weights between timeframes (normalised across whichever are selected).
-TIMEFRAME_WEIGHTS = {"4h": 0.4, "1d": 0.6, "1wk": 0.5}
+TIMEFRAME_WEIGHTS = {"1h": 0.2, "2h": 0.3, "4h": 0.4, "1d": 0.6, "1wk": 0.5}
 
 # Weights for breakout sub-scores (sum need not be 1; normalised internally).
 # Breakout sub-scores as a 100-point checklist (weights == points / 100):
@@ -79,6 +79,34 @@ DISTRIBUTION_WEIGHTS = {
     "dist_days": 0.08,   # count of high-volume down days (O'Neil)
 }
 
+# Accumulation / "smart-money (HNI/institutional) buying" sub-scores (0-100,
+# higher = money coming IN). This is the mirror of distribution: positive/rising
+# Chaikin Money Flow, up-day volume dominance, OBV confirming new highs, a rising
+# Money-Flow Index and positive relative strength are the footprint of large
+# investors accumulating. (For ETFs there is no filed HNI data, so this is a
+# price/volume proxy for institutional demand.)
+ACCUMULATION_WEIGHTS = {
+    "cmf": 0.30,        # Chaikin Money Flow positive / rising (buying pressure)
+    "upvol": 0.25,      # up-day volume dominating down-day volume
+    "obv_conf": 0.20,   # OBV confirming price highs (accumulation, not divergence)
+    "mfi": 0.15,        # Money Flow Index rising / above 50
+    "rs": 0.10,         # positive relative strength vs benchmark
+}
+
+
+# Imminence / "trigger" sub-scores (0-100, higher = breakout is firing NOW).
+# The breakout (readiness) score measures *setup quality* — a coiled base can
+# stay coiled for weeks. The imminence score measures whether that spring is
+# actually *releasing right now*: price pushing the breakout line, volume
+# expanding, ADX ticking up, the squeeze firing and MACD histogram expanding.
+IMMINENCE_WEIGHTS = {
+    "range_position": 0.30,   # price near / above the breakout line (20-bar high)
+    "volume_thrust": 0.25,    # recent volume expanding through ~1.3x+
+    "adx_rising": 0.15,       # ADX ticking up (trend waking, not dying)
+    "squeeze_firing": 0.15,   # Bollinger bandwidth expanding off a tight squeeze
+    "avwap": 0.15,            # price above / reclaiming the base's anchored VWAP
+}
+
 
 def _gaussian(x: float, center: float, width: float) -> float:
     """Bell curve peaking at 1.0 when x == center."""
@@ -95,9 +123,11 @@ class TimeframeResult:
     breakout: float = 0.0
     exit: float = 0.0
     distribution: float = 0.0
+    accumulation: float = 0.0
     breakout_parts: dict = field(default_factory=dict)
     exit_parts: dict = field(default_factory=dict)
     distribution_parts: dict = field(default_factory=dict)
+    accumulation_parts: dict = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
 
 
@@ -118,7 +148,7 @@ def score_timeframe(df: pd.DataFrame, bench_df: pd.DataFrame | None) -> Timefram
     macd_line, signal_line, hist = ind.macd(close)
     rsi = ind.rsi(close)
     adx, plus_di, minus_di = ind.adx(high, low, close)
-    _, bb_up, _, bandwidth = ind.bollinger(close)
+    _, bb_up, bb_low, bandwidth = ind.bollinger(close)
     bw_pct = ind.bandwidth_percentile(bandwidth)
     atr = ind.atr(high, low, close)
     ema20 = ind.ema(close, 20)
@@ -135,6 +165,7 @@ def score_timeframe(df: pd.DataFrame, bench_df: pd.DataFrame | None) -> Timefram
     rsi_v = rsi.iloc[last]
     rsi_prev = rsi.iloc[last - 3] if len(rsi) > 3 else rsi_v
     adx_v = adx.iloc[last]
+    adx_prev = float(adx.iloc[last - 3]) if len(adx) > 3 else float(adx_v)
     plus_v = plus_di.iloc[last]
     minus_v = minus_di.iloc[last]
 
@@ -149,6 +180,16 @@ def score_timeframe(df: pd.DataFrame, bench_df: pd.DataFrame | None) -> Timefram
     vol_recent = volume.tail(5).mean()
     vol_base = volume.tail(25).head(20).mean()
     vol_ratio = (vol_recent / vol_base) if vol_base else 1.0
+
+    # Anchored VWAP — anchored at the swing low of the recent base (the lowest
+    # low over a ~90-bar lookback). Price holding above it means every buyer
+    # since the base low is in profit / in control, a bullish breakout trigger.
+    avwap_lookback = min(len(df), 90)
+    window_low = low.iloc[-avwap_lookback:]
+    anchor_idx = len(df) - avwap_lookback + int(np.argmin(window_low.values))
+    avwap_series = ind.anchored_vwap(high, low, close, volume, anchor_idx)
+    avwap_v = float(avwap_series.iloc[-1])
+    avwap_dist_pct = ((price - avwap_v) / avwap_v * 100) if avwap_v > 0 else None
 
     # ---------------- Breakout sub-scores (100-point checklist) ----------------
     # MACD near zero and turning up  (30 pts).
@@ -232,6 +273,7 @@ def score_timeframe(df: pd.DataFrame, bench_df: pd.DataFrame | None) -> Timefram
     # OBV/price divergence over ~15 bars: price near its recent high but OBV well
     # off its own high => accumulation is quietly reversing.
     div_score = 0.0
+    obv_conf = 50.0  # OBV confirming price highs => accumulation (default neutral)
     n = 15
     if len(close) > n and len(obv_line) > n:
         pr = close.tail(n)
@@ -241,6 +283,8 @@ def score_timeframe(df: pd.DataFrame, bench_df: pd.DataFrame | None) -> Timefram
         if not (math.isnan(pr_rank) or math.isnan(ov_rank)):
             # High price-rank with low OBV-rank => bearish divergence.
             div_score = _clamp((pr_rank - ov_rank) * 150) if pr_rank >= 0.5 else 0.0
+            # OBV confirmation: OBV near its own highs => volume backing the move.
+            obv_conf = _clamp(ov_rank * 100)
 
     # Chaikin Money Flow: -0.10 or lower => full marks, +0.10 => zero.
     cmf_score = _clamp((0.10 - cmf_v) / 0.20 * 100)
@@ -276,6 +320,24 @@ def score_timeframe(df: pd.DataFrame, bench_df: pd.DataFrame | None) -> Timefram
     }
     distribution_score = _weighted(distribution_parts, DISTRIBUTION_WEIGHTS)
 
+    # ---------------- Accumulation sub-scores ("smart money / HNI buying in") --
+    # Mirror of distribution — fires when volume/flow is coming IN. A price/volume
+    # proxy for large-investor (HNI/institutional) demand.
+    cmf_acc = _clamp((cmf_v + 0.10) / 0.20 * 100)          # +0.10 => 100, -0.10 => 0
+    upvol_acc = _clamp((0.5 - dvr) / 0.25 * 100)           # up-volume dominance
+    mfi_acc = _clamp((mfi_v - 45) / 25 * 100)
+    if mfi_v < mfi_prev:                                   # falling MFI => dampen
+        mfi_acc = _clamp(mfi_acc - 20)
+    rs_acc = _clamp(rel_str / 10 * 100)                    # +10% RS => 100
+    accumulation_parts = {
+        "cmf": round(cmf_acc, 1),
+        "upvol": round(upvol_acc, 1),
+        "obv_conf": round(obv_conf, 1),
+        "mfi": round(mfi_acc, 1),
+        "rs": round(rs_acc, 1),
+    }
+    accumulation_score = _weighted(accumulation_parts, ACCUMULATION_WEIGHTS)
+
     # Signal line as % of price + how long MACD has hugged the zero line.
     signal_v = float(signal_line.iloc[last])
     signal_pct = signal_v / price * 100
@@ -297,13 +359,23 @@ def score_timeframe(df: pd.DataFrame, bench_df: pd.DataFrame | None) -> Timefram
         "plus_di": round(float(plus_v), 1),
         "minus_di": round(float(minus_v), 1),
         "bandwidth_pct_rank": round(float(bw_pct), 0),
+        "bandwidth": round(float(bandwidth.iloc[last]), 3),
+        "bandwidth_prev": round(float(bandwidth.iloc[last - 3]), 3) if len(bandwidth) > 3 else round(float(bandwidth.iloc[last]), 3),
+        "adx_prev": round(float(adx_prev), 1),
+        "hist_pct": round(float(hist_v) / float(price) * 100, 4),
+        "hist_prev_pct": round(float(hist_prev) / float(price) * 100, 4),
         "rel_strength_pct": round(float(rel_str), 2),
         "vol_ratio": round(float(vol_ratio), 2),
         "avg_vol": round(float(vol_base), 0) if vol_base else None,
+        "avwap": round(avwap_v, 2) if avwap_v > 0 else None,
+        "avwap_dist_pct": round(float(avwap_dist_pct), 2) if avwap_dist_pct is not None else None,
         "cmf": round(cmf_v, 3),
         "mfi": round(mfi_v, 1),
         "dist_days": dist_days,
         "ema20_atr_ext": round(float(ema_ext_atr), 2),
+        "pct_b": (round(float((price - bb_low.iloc[last]) /
+                  ((bb_up.iloc[last] - bb_low.iloc[last]) or np.nan)), 3)
+                  if not math.isnan(float(bb_up.iloc[last])) else None),
         "dist_200dma_pct": round(float(dist_200), 2) if dist_200 is not None else None,
     }
 
@@ -312,9 +384,11 @@ def score_timeframe(df: pd.DataFrame, bench_df: pd.DataFrame | None) -> Timefram
         breakout=round(breakout, 1),
         exit=round(exit_score, 1),
         distribution=round(distribution_score, 1),
+        accumulation=round(accumulation_score, 1),
         breakout_parts=breakout_parts,
         exit_parts=exit_parts,
         distribution_parts=distribution_parts,
+        accumulation_parts=accumulation_parts,
         raw=raw,
     )
 
@@ -331,6 +405,8 @@ class SectorScore:
     breakout_trend: str = "→ Flat"
     exit_delta: float = 0.0
     distribution_score: float = 0.0
+    accumulation_score: float = 0.0
+    volume_score: float = 0.0
     targets: dict = field(default_factory=dict)
     consolidation: dict = field(default_factory=dict)
     action: str = ""
@@ -338,19 +414,36 @@ class SectorScore:
     maturity: str = "—"
     maturity_note: str = ""
     readiness_factor: float = 1.0
+    imminence: float = 0.0
+    imminence_label: str = "—"
+    imminence_note: str = ""
+    imminence_parts: dict = field(default_factory=dict)
+    dist_to_breakout_pct: float | None = None
+    range_position: float | None = None
+    imminence_1w_ago: float | None = None
+    exit_imminence: float = 0.0
+    exit_imminence_label: str = "—"
+    exit_imminence_note: str = ""
+    exit_imminence_parts: dict = field(default_factory=dict)
+    next_day: float = 0.0
+    next_day_label: str = "—"
+    next_day_color: str = ""
+    next_day_parts: dict = field(default_factory=dict)
     patterns: dict = field(default_factory=dict)
     breakout_1w_ago: float | None = None
     breakout_2w_ago: float | None = None
+    st_mtf: dict = field(default_factory=dict)
 
 
 # Bars ≈ two weeks per timeframe for the score trend (10 trading days on 1D;
-# ~2 four-hour bars per session × 10 sessions on 4h).
-TREND_LOOKBACK = {"1d": 10, "4h": 20, "1wk": 4}
+# ~2 four-hour bars per session × 10 sessions on 4h). Intraday counts assume
+# ~7 one-hour bars per US session.
+TREND_LOOKBACK = {"1h": 70, "2h": 35, "4h": 20, "1d": 10, "1wk": 4}
 
 # Per-timeframe bar counts for looking the score back 1 and 2 weeks.
 HORIZON_LOOKBACK = {
-    "1w": {"1d": 5, "4h": 10, "1wk": 1},
-    "2w": {"1d": 10, "4h": 20, "1wk": 2},
+    "1w": {"1h": 35, "2h": 17, "4h": 10, "1d": 5, "1wk": 1},
+    "2w": {"1h": 70, "2h": 35, "4h": 20, "1d": 10, "1wk": 2},
 }
 
 
@@ -619,6 +712,297 @@ def lifecycle_stage(breakout: float, exit_score: float, distribution: float,
             "color": ""}
 
 
+# Imminence bands: how to label the trigger score for the user.
+IMMINENCE_BANDS = [
+    (75, "🚀 Firing",   "Trigger active — breaking out now", "#1e7d46"),
+    (55, "🔥 Warming",  "Warming up — trigger building",     "#3f7d46"),
+    (35, "⏳ Coiling",  "Coiled, no trigger yet — watchlist", "#b3952f"),
+    (0,  "💤 Dormant",  "Dormant — no imminent move",         "#5a5f64"),
+]
+
+
+def imminence_score(raw: dict, targets: dict, consolidation: dict) -> dict:
+    """Score how *imminent* a breakout is (0-100) — distinct from readiness.
+
+    Readiness (the breakout score) says a base is *well-formed*; imminence says
+    the spring is *releasing right now*. Built from five triggers:
+      * range_position — price pushing / above the breakout line (20-bar high)
+      * volume_thrust  — recent volume expanding through ~1.3x+
+      * adx_rising     — ADX ticking up (trend waking, not dying)
+      * squeeze_firing — Bollinger bandwidth expanding off a tight squeeze
+      * avwap          — price holding above / reclaiming the base's anchored VWAP
+
+    Returns {score, parts, label, note, color, dist_to_breakout_pct,
+    range_position} — an empty-ish dict when data is missing.
+    """
+    if not raw:
+        return {"score": 0.0, "parts": {}, "label": "—", "note": "",
+                "color": "", "dist_to_breakout_pct": None, "range_position": None}
+
+    price = raw.get("price")
+    # ---- 1) Distance to the breakout line (20-bar high / range top) ----
+    breakout_level = None
+    if targets:
+        breakout_level = targets.get("breakout_level")
+    if breakout_level is None and consolidation:
+        breakout_level = consolidation.get("range_high")
+    dist_pct = None
+    if price and breakout_level and price > 0:
+        dist_pct = (breakout_level - price) / price * 100  # +ve = still below line
+        # At/above the line → 100; taper to 0 by ~6% below it.
+        range_pos_score = _clamp(100 - (dist_pct / 6.0) * 100)
+    else:
+        range_pos_score = 50.0
+
+    # Where price sits inside its detected box (0 = bottom, 1 = top).
+    range_position = None
+    if consolidation:
+        lo = consolidation.get("range_low")
+        hi = consolidation.get("range_high")
+        if price and lo is not None and hi is not None and hi > lo:
+            range_position = round((price - lo) / (hi - lo), 2)
+
+    # ---- 2) Volume thrust: 1.0x → 0, 1.6x+ → 100 ----
+    vol_ratio = raw.get("vol_ratio") or 1.0
+    vol_score = _clamp((vol_ratio - 1.0) / (1.6 - 1.0) * 100)
+
+    # ---- 3) ADX rising: reward an up-tick, penalise a fade ----
+    adx_v = raw.get("adx")
+    adx_prev = raw.get("adx_prev")
+    if adx_v is not None and adx_prev is not None:
+        adx_score = _clamp(50 + (adx_v - adx_prev) * 15)
+    else:
+        adx_score = 50.0
+
+    # ---- 4) Squeeze firing: bandwidth expanding off its recent low ----
+    bw = raw.get("bandwidth")
+    bw_prev = raw.get("bandwidth_prev")
+    if bw is not None and bw_prev and bw_prev > 0:
+        expand_pct = (bw - bw_prev) / bw_prev * 100
+        squeeze_score = _clamp(50 + expand_pct * 10)
+    else:
+        squeeze_score = 50.0
+
+    # ---- 5) Anchored VWAP: price above / reclaiming the base's AVWAP ----
+    # Above the base's anchored VWAP => every buyer since the base low is in
+    # profit and in control (bullish). +3.3% above => 100, at AVWAP => 50,
+    # −3.3% below => 0.
+    avwap_dist = raw.get("avwap_dist_pct")
+    if avwap_dist is not None:
+        avwap_score = _clamp(50 + avwap_dist * 15)
+    else:
+        avwap_score = 50.0
+
+    parts = {
+        "range_position": round(range_pos_score, 1),
+        "volume_thrust": round(vol_score, 1),
+        "adx_rising": round(adx_score, 1),
+        "squeeze_firing": round(squeeze_score, 1),
+        "avwap": round(avwap_score, 1),
+    }
+    score = round(_weighted(parts, IMMINENCE_WEIGHTS), 1)
+
+    label, note, color = IMMINENCE_BANDS[-1][1:]
+    for lo, lbl, nte, col in IMMINENCE_BANDS:
+        if score >= lo:
+            label, note, color = lbl, nte, col
+            break
+
+    return {
+        "score": score,
+        "parts": parts,
+        "label": label,
+        "note": note,
+        "color": color,
+        "dist_to_breakout_pct": round(dist_pct, 1) if dist_pct is not None else None,
+        "range_position": range_position,
+    }
+
+
+# Exit / breakdown-trigger weights (mirror of IMMINENCE_WEIGHTS, downside).
+# The exit score says a name is *extended* (a top may form); this says the top
+# is *actually firing right now* — price losing support, selling volume
+# expanding, momentum rolling down, band breaking down and money flowing out.
+EXIT_IMMINENCE_WEIGHTS = {
+    "support_break": 0.30,   # price losing the box low / falling below the 20-EMA
+    "downvol_thrust": 0.25,  # volume expanding on weakness (heavy selling)
+    "momentum_down": 0.15,   # MACD histogram negative & expanding, -DI over +DI
+    "band_breakdown": 0.15,  # Bollinger %B dropping from the upper half
+    "dist_flip": 0.15,       # Chaikin Money Flow turning negative (distribution)
+}
+
+# Exit / breakdown-trigger bands: score → (label, note, color).
+EXIT_IMMINENCE_BANDS = [
+    (72, "🔴 Breaking down", "Top firing — actively rolling over now", "#b23b3b"),
+    (52, "🟠 Rolling over",  "Starting to roll over — tighten stops",  "#b3702f"),
+    (32, "🟡 Wobbling",      "Some weakness — watch, not firing yet",   "#b3952f"),
+    (0,  "🟢 Holding up",    "Trend still intact — no breakdown",        "#3f7d46"),
+]
+
+
+def exit_imminence_score(raw: dict, targets: dict, consolidation: dict,
+                         distribution: float = 0.0) -> dict:
+    """Score how *imminent a breakdown / top* is (0-100) — the downside mirror of
+    ``imminence_score``. The exit score says a name is *extended*; this says the
+    top is *actually firing now* so profit-taking/exits act on a real roll-over,
+    not merely on extension (letting winners run while the trend holds).
+
+    Built from five downside triggers:
+      * support_break  — price losing the box low / falling below the 20-EMA
+      * downvol_thrust — volume expanding while price is weak (heavy selling)
+      * momentum_down  — MACD histogram negative & expanding, -DI over +DI
+      * band_breakdown — Bollinger %B dropping out of the upper half
+      * dist_flip      — Chaikin Money Flow turning negative (distribution)
+
+    Returns {score, parts, label, note, color}.
+    """
+    if not raw:
+        return {"score": 0.0, "parts": {}, "label": "—", "note": "", "color": ""}
+
+    price = raw.get("price")
+
+    # Where price sits in its box (0 = bottom/support, 1 = top).
+    range_position = None
+    if consolidation:
+        lo = consolidation.get("range_low")
+        hi = consolidation.get("range_high")
+        if price and lo is not None and hi is not None and hi > lo:
+            range_position = (price - lo) / (hi - lo)
+
+    # ---- 1) Support break: near/under the box low AND below the 20-EMA ----
+    if range_position is not None:
+        box_score = _clamp((0.45 - range_position) / 0.45 * 100)  # bottom => 100
+    else:
+        box_score = 50.0
+    ema_ext = raw.get("ema20_atr_ext")  # ATRs above EMA20; negative = below
+    ema_score = _clamp(50 - (ema_ext or 0.0) * 25) if ema_ext is not None else 50.0
+    support_break = (box_score + ema_score) / 2
+
+    # ---- 2) Down-volume thrust: volume expanding while price is weak ----
+    hist = raw.get("hist_pct")
+    weak = (hist is not None and hist < 0) or (ema_ext is not None and ema_ext < 0)
+    vol_ratio = raw.get("vol_ratio") or 1.0
+    vol_comp = _clamp((vol_ratio - 1.0) / (1.6 - 1.0) * 100)
+    downvol_thrust = vol_comp if weak else vol_comp * 0.3
+
+    # ---- 3) Momentum rolling down: MACD histogram & DI alignment ----
+    hist_prev = raw.get("hist_prev_pct")
+    momentum_down = 50.0
+    if hist is not None and hist_prev is not None:
+        momentum_down = 50.0
+        momentum_down += 25 if hist < 0 else -25
+        momentum_down += 25 if hist < hist_prev else -25
+    plus_di = raw.get("plus_di")
+    minus_di = raw.get("minus_di")
+    if plus_di is not None and minus_di is not None:
+        momentum_down += 10 if minus_di > plus_di else -10
+    momentum_down = _clamp(momentum_down)
+
+    # ---- 4) Bollinger breakdown: %B dropping out of the upper half ----
+    pct_b = raw.get("pct_b")
+    band_breakdown = _clamp((0.5 - pct_b) / 0.5 * 100) if pct_b is not None else 50.0
+
+    # ---- 5) Distribution flip: CMF turning negative ----
+    cmf_v = raw.get("cmf")
+    if cmf_v is not None:
+        dist_flip = _clamp((0.05 - cmf_v) / 0.15 * 100)
+    else:
+        dist_flip = _clamp(distribution)  # fall back to the blended distribution
+
+    parts = {
+        "support_break": round(support_break, 1),
+        "downvol_thrust": round(downvol_thrust, 1),
+        "momentum_down": round(momentum_down, 1),
+        "band_breakdown": round(band_breakdown, 1),
+        "dist_flip": round(dist_flip, 1),
+    }
+    score = round(_weighted(parts, EXIT_IMMINENCE_WEIGHTS), 1)
+
+    label, note, color = EXIT_IMMINENCE_BANDS[-1][1:]
+    for lo, lbl, nte, col in EXIT_IMMINENCE_BANDS:
+        if score >= lo:
+            label, note, color = lbl, nte, col
+            break
+
+    return {"score": score, "parts": parts, "label": label, "note": note,
+            "color": color}
+
+
+# Next-day outlook bands: score → (label, color).
+NEXT_DAY_BANDS = [
+    (66, "🟢 Likely up",     "#1e7d46"),
+    (54, "🟩 Lean bullish",  "#3f7d46"),
+    (46, "➖ Flat / range",  "#5a5f64"),
+    (34, "🟧 Lean weak",     "#b3702f"),
+    (0,  "🔴 Likely down",   "#b23b3b"),
+]
+
+# How much each driver moves the next-session bias. Smart-money (HNI) flow and
+# volume lead (who is buying + is it backed), then relative strength, then the
+# momentum/location trio (MACD histogram, price vs 20-EMA, Bollinger %B).
+NEXT_DAY_WEIGHTS = {
+    "hni": 0.28,          # smart-money / HNI accumulation
+    "volume": 0.24,       # volume confirmation / thrust
+    "rel_strength": 0.16, # leading or lagging the benchmark
+    "macd": 0.14,         # MACD histogram positive & expanding
+    "ema20": 0.10,        # price above / below the 20-EMA
+    "bollinger": 0.08,    # position within the Bollinger bands (%B)
+}
+
+
+def next_day_outlook(volume_score: float, accumulation_score: float,
+                     raw: dict) -> dict:
+    """Short-horizon (next-session) directional bias.
+
+    Blends the drivers the user asked for: **volume** confirmation, **relative
+    strength**, the **HNI/accumulation** (smart-money) score, plus **MACD**
+    (histogram direction), the **20-day EMA** (price above/below) and the
+    **Bollinger band** position (%B). This is a *bias*, not a certainty — it says
+    which way the odds lean for the next day.
+
+    Returns {score, label, color, parts}.
+    """
+    raw = raw or {}
+    vol = float(volume_score or 0.0)
+    hni = float(accumulation_score or 0.0)
+
+    # Relative strength (% vs benchmark): +10% => 100, -10% => 0.
+    rs = _clamp(50 + (raw.get("rel_strength_pct") or 0.0) * 5)
+
+    # MACD histogram: positive and expanding => bullish next-day momentum.
+    hist = raw.get("hist_pct")
+    hist_prev = raw.get("hist_prev_pct")
+    macd = 50.0
+    if hist is not None and hist_prev is not None:
+        macd = 50.0 + (25 if hist > 0 else -25) + (25 if hist > hist_prev else -25)
+        macd = _clamp(macd)
+
+    # Price vs 20-EMA (in ATRs): above => bullish; ~1 ATR above => strong.
+    ext = raw.get("ema20_atr_ext")
+    ema20 = _clamp(50 + (ext * 25)) if ext is not None else 50.0
+
+    # Bollinger %B: 0.5 => mid (neutral 50), 1.0 => upper band (bullish 100),
+    # 0.0 => lower band (bearish 0). Riding the upper band = momentum.
+    pct_b = raw.get("pct_b")
+    boll = _clamp(pct_b * 100) if pct_b is not None else 50.0
+
+    parts = {
+        "hni": round(hni, 1),
+        "volume": round(vol, 1),
+        "rel_strength": round(rs, 1),
+        "macd": round(macd, 1),
+        "ema20": round(ema20, 1),
+        "bollinger": round(boll, 1),
+    }
+    score = round(_weighted(parts, NEXT_DAY_WEIGHTS), 1)
+    label, color = NEXT_DAY_BANDS[-1][1:]
+    for lo, lbl, col in NEXT_DAY_BANDS:
+        if score >= lo:
+            label, color = lbl, col
+            break
+    return {"score": score, "label": label, "color": color, "parts": parts}
+
+
 def score_sector(
     ticker: str, name: str, frames: dict, bench_frames: dict,
     timeframes: tuple[str, ...] = ("4h", "1d"),
@@ -631,10 +1015,15 @@ def score_sector(
     breakout_vals = {k: (tf[k].breakout if tf[k].ok else None) for k in TIMEFRAMES}
     exit_vals = {k: (tf[k].exit if tf[k].ok else None) for k in TIMEFRAMES}
     dist_vals = {k: (tf[k].distribution if tf[k].ok else None) for k in TIMEFRAMES}
+    acc_vals = {k: (tf[k].accumulation if tf[k].ok else None) for k in TIMEFRAMES}
+    vol_vals = {k: (tf[k].breakout_parts.get("volume") if tf[k].ok else None)
+                for k in TIMEFRAMES}
 
     setup_quality = round(_blend(breakout_vals, timeframes), 1)
     exit_score = round(_blend(exit_vals, timeframes), 1)
     distribution_score = round(_blend(dist_vals, timeframes), 1)
+    accumulation_score = round(_blend(acc_vals, timeframes), 1)
+    volume_score = round(_blend(vol_vals, timeframes), 1)
 
     # ---- Score trend: re-score a few bars back and compare ----
     prev_breakout_vals: dict[str, float | None] = {}
@@ -689,6 +1078,16 @@ def score_sector(
     if consolidation:
         consolidation["maturity"] = maturity["label"]
 
+    # ---- Imminence / trigger: is the well-formed base actually firing NOW? ----
+    imm = imminence_score(target_raw, targets, consolidation)
+
+    # ---- Exit / breakdown trigger: is a top actually firing NOW? ----
+    exit_imm = exit_imminence_score(target_raw, targets, consolidation,
+                                    distribution_score)
+
+    # ---- Next-day outlook: short-horizon directional bias ----
+    nxt = next_day_outlook(volume_score, accumulation_score, target_raw)
+
     # ---- Chart patterns on the primary timeframe frame ----
     patterns = (
         pat.detect_patterns(frames.get(target_key, pd.DataFrame()))
@@ -703,6 +1102,8 @@ def score_sector(
         breakout_trend=_trend_label(breakout_delta),
         exit_delta=exit_delta,
         distribution_score=distribution_score,
+        accumulation_score=accumulation_score,
+        volume_score=volume_score,
         targets=targets,
         consolidation=consolidation,
         action=action,
@@ -710,6 +1111,20 @@ def score_sector(
         maturity=maturity["label"],
         maturity_note=maturity["note"],
         readiness_factor=factor,
+        imminence=imm["score"],
+        imminence_label=imm["label"],
+        imminence_note=imm["note"],
+        imminence_parts=imm["parts"],
+        dist_to_breakout_pct=imm["dist_to_breakout_pct"],
+        range_position=imm["range_position"],
+        exit_imminence=exit_imm["score"],
+        exit_imminence_label=exit_imm["label"],
+        exit_imminence_note=exit_imm["note"],
+        exit_imminence_parts=exit_imm["parts"],
+        next_day=nxt["score"],
+        next_day_label=nxt["label"],
+        next_day_color=nxt["color"],
+        next_day_parts=nxt["parts"],
         patterns=patterns,
     )
 
@@ -729,3 +1144,154 @@ def breakout_snapshot(
         return score_sector(ticker, name, past, bench_frames, timeframes).breakout_score
     except Exception:
         return None
+
+
+def imminence_snapshot(
+    ticker: str, name: str, frames: dict, bench_frames: dict,
+    timeframes: tuple[str, ...], horizon: str,
+) -> float | None:
+    """Re-run the imminence/trigger score 'as of' 1 or 2 weeks ago (``horizon`` in
+    {'1w','2w'}) so it can be compared against the current value."""
+    lookback = HORIZON_LOOKBACK.get(horizon)
+    if not lookback:
+        return None
+    past = _frames_back(frames, lookback)
+    try:
+        return score_sector(ticker, name, past, bench_frames, timeframes).imminence
+    except Exception:
+        return None
+
+
+def score_snapshot(
+    ticker: str, name: str, frames: dict, bench_frames: dict,
+    timeframes: tuple[str, ...], horizon: str,
+) -> "SectorScore | None":
+    """Re-run the FULL score 'as of' 1 or 2 weeks ago (``horizon`` in {'1w','2w'})
+    and return the whole historical ``SectorScore``. Use this when you need more
+    than one field from the past (e.g. both imminence and exit-imminence) so the
+    expensive re-score runs only once."""
+    lookback = HORIZON_LOOKBACK.get(horizon)
+    if not lookback:
+        return None
+    past = _frames_back(frames, lookback)
+    try:
+        return score_sector(ticker, name, past, bench_frames, timeframes)
+    except Exception:
+        return None
+
+
+# ===========================================================================
+# MTF Supertrend reversal score
+# ---------------------------------------------------------------------------
+# Lower timeframes flip *before* the higher (anchor) timeframe, so a pending
+# reversal of the anchor trend shows up as a bottom-up cascade of lower-TF
+# Supertrend flips. The score blends that weighted cascade with how close the
+# anchor's own close sits to its Supertrend flip line (in ATRs). Higher score =
+# the anchor trend is more likely to REVERSE soon.
+# ===========================================================================
+
+# combo label -> timeframes (ascending); the LAST entry is the anchor trend.
+ST_COMBOS = {
+    "1h+2h+4h": ["1h", "2h", "4h"],
+    "1h+2h+4h+1d": ["1h", "2h", "4h", "1d"],
+    "1h+2h+4h+1d+1w": ["1h", "2h", "4h", "1d", "1wk"],
+}
+
+# Leading weight of each timeframe: a flip on a bigger TF is a stronger lead.
+ST_TF_WEIGHT = {"1h": 1.0, "2h": 2.0, "4h": 3.0, "1d": 4.0, "1wk": 5.0}
+
+# Bars ≈ 1 / 2 weeks per timeframe for the historical (1w/2w ago) scores.
+ST_LOOKBACK = {
+    "1w": {"1h": 35, "2h": 17, "4h": 10, "1d": 5, "1wk": 1},
+    "2w": {"1h": 70, "2h": 35, "4h": 20, "1d": 10, "1wk": 2},
+}
+
+_ST_PERIOD = 10
+_ST_MULT = 3.0
+
+
+def _st_state(df: pd.DataFrame) -> dict | None:
+    """Current Supertrend state of one timeframe: direction (+1/-1), distance to
+    the flip line in ATRs, and the flip (line) price. None if not computable."""
+    if df is None or len(df) < _ST_PERIOD + 5:
+        return None
+    if not {"High", "Low", "Close"}.issubset(df.columns):
+        return None
+    line, direction = ind.supertrend(df["High"], df["Low"], df["Close"],
+                                     _ST_PERIOD, _ST_MULT)
+    d = direction.iloc[-1]
+    if pd.isna(d):
+        return None
+    close = float(df["Close"].iloc[-1])
+    ln = float(line.iloc[-1])
+    atr_series = ind.atr(df["High"], df["Low"], df["Close"], _ST_PERIOD)
+    atr_last = float(atr_series.iloc[-1]) if not atr_series.empty else float("nan")
+    dist_atr = abs(close - ln) / atr_last if atr_last and not math.isnan(atr_last) else None
+    return {"dir": int(d), "dist_atr": dist_atr, "flip_price": ln, "close": close}
+
+
+def supertrend_reversal(frames: dict, tfs: list[str]) -> dict | None:
+    """Reversal-probability score for one timeframe stack ``tfs`` (ascending;
+    last = anchor). Returns a dict with score (0-100, higher = reversal more
+    likely), the anchor trend, the flip target, the MTF stack string and the
+    anchor distance-to-flip in ATRs — or None if the anchor can't be scored."""
+    states: dict[str, dict] = {}
+    for tf in tfs:
+        s = _st_state(frames.get(tf, pd.DataFrame()))
+        if s is not None:
+            states[tf] = s
+    if not tfs:
+        return None
+    anchor = tfs[-1]
+    if anchor not in states:
+        return None
+
+    anchor_dir = states[anchor]["dir"]
+    lowers = tfs[:-1]
+
+    # Weighted fraction of lower TFs that have already flipped OPPOSITE to the
+    # anchor — the leading edge of a bottom-up reversal cascade.
+    tot_w = sum(ST_TF_WEIGHT.get(tf, 1.0) for tf in lowers if tf in states)
+    flipped_w = sum(ST_TF_WEIGHT.get(tf, 1.0) for tf in lowers
+                    if tf in states and states[tf]["dir"] != anchor_dir)
+    cascade = (flipped_w / tot_w) if tot_w else 0.0
+
+    # How ripe the anchor itself is: close within a few ATRs of its flip line.
+    da = states[anchor]["dist_atr"]
+    prox = 0.0 if da is None else max(0.0, 1.0 - da / 3.0)
+
+    score = round(100.0 * (0.65 * cascade + 0.35 * prox))
+
+    stack = "".join("🟢" if states[tf]["dir"] > 0 else "🔴"
+                    for tf in tfs if tf in states)
+    trend = "🟢 Bull" if anchor_dir > 0 else "🔴 Bear"
+    reversal_to = "🔴 → Bear" if anchor_dir > 0 else "🟢 → Bull"
+
+    return {
+        "score": float(score),
+        "trend": trend,
+        "reversal_to": reversal_to,
+        "stack": stack,
+        "dist_atr": da,
+        "flip_price": states[anchor]["flip_price"],
+        "anchor": anchor,
+    }
+
+
+def mtf_supertrend_all(frames: dict) -> dict:
+    """Compute the reversal score for every combo in ``ST_COMBOS`` plus the same
+    score 1 and 2 weeks ago (frames trimmed by ``ST_LOOKBACK`` bars). Returns
+    ``{combo_label: {score, trend, stack, dist_atr, score_1w, score_2w, ...}}``.
+    Combos whose anchor can't be scored map to None."""
+    out: dict = {}
+    for label, tfs in ST_COMBOS.items():
+        cur = supertrend_reversal(frames, tfs)
+        if cur is None:
+            out[label] = None
+            continue
+        past_1w = supertrend_reversal(_frames_back(frames, ST_LOOKBACK["1w"]), tfs)
+        past_2w = supertrend_reversal(_frames_back(frames, ST_LOOKBACK["2w"]), tfs)
+        cur["score_1w"] = past_1w["score"] if past_1w else None
+        cur["score_2w"] = past_2w["score"] if past_2w else None
+        out[label] = cur
+    return out
