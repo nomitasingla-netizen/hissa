@@ -1367,6 +1367,9 @@ with tab_swp:
 
             swp_rows = []
             sip_candidates = []
+            # Bearish holdings whose reversal-to-Bull score is at/above this get a
+            # small "reversal starter" SIP ahead of a likely bear→bull flip.
+            ST_REV_SIP_MIN = 90
             with st.spinner("Scoring your holdings on the Supertrend reversal…"):
                 for p in swp_positions:
                     try:
@@ -1410,12 +1413,22 @@ with tab_swp:
                              "#b91c1c" if final_pct >= 15 else
                              "#c2410c" if final_pct >= 6 else "")
 
-                    # ---- SIP-entry candidacy: Bullish + LOW reversal score ----
+                    # ---- SIP-entry candidacy ----
+                    # (a) Bullish + LOW reversal score → uptrend firmly intact, or
+                    # (b) Bearish + VERY HIGH reversal score → a bear→bull flip is
+                    #     imminent, so take a small "reversal starter" SIP.
                     is_bull = isinstance(trend, str) and "Bull" in trend
-                    if is_bull and score is not None and score < 55 and price:
-                        tier_w, tier_lbl = ((1.0, "🟢 Strong") if score < 20 else
-                                            (0.66, "🟢 SIP") if score < 40 else
-                                            (0.33, "🟡 Light"))
+                    is_bear = isinstance(trend, str) and "Bear" in trend
+                    bull_sip = is_bull and score is not None and score < 55
+                    rev_sip = (is_bear and score is not None
+                               and score >= ST_REV_SIP_MIN)
+                    if (bull_sip or rev_sip) and price:
+                        if bull_sip:
+                            tier_w, tier_lbl = ((1.0, "🟢 Strong") if score < 20 else
+                                                (0.66, "🟢 SIP") if score < 40 else
+                                                (0.33, "🟡 Light"))
+                        else:
+                            tier_w, tier_lbl = (0.25, "🔵 Reversal starter")
                         ema_dist = sc.get("ema10_dist_pct")
                         # Reward pullbacks toward/below the 10-day EMA; fade extension.
                         if ema_dist is None:
@@ -1440,6 +1453,7 @@ with tab_swp:
                         sip_candidates.append({
                             "yf": p["yf"], "Symbol": p["symbol"], "Market": p["market"],
                             "price": price, "score": score, "ema_dist": ema_dist,
+                            "trend": trend, "reversal_starter": rev_sip,
                             "existing_value": round((qty or 0) * price, 2),
                             "weight": tier_w * ema_f * fresh_f,
                             "tier": tier_lbl, "fresh": not recent_buy,
@@ -1545,13 +1559,16 @@ with tab_swp:
                 # ================= SIP deployment (entry side) =================
                 st.divider()
                 st.markdown(
-                    "#### 💧 SIP deployment — bullish sectors with a low reversal score")
+                    "#### 💧 SIP deployment — bullish (low score) & reversal-imminent "
+                    "(bearish, very high score) sectors")
                 if not any((swp_cash.get(m) or 0) > 0 for m in swp_markets):
                     st.caption(
                         "Enter investable cash above to get a **diversified** SIP plan: "
                         "cash is split across your bullish, low-reversal-score holdings "
                         "(different sectors), tilted toward names near/below their "
-                        "10-day EMA, and reduced for names you already bought this bar.")
+                        "10-day EMA, and reduced for names you already bought this bar. "
+                        "A small **starter** slice also goes to bearish names whose "
+                        f"reversal-to-Bull score is ≥ 90 (flip looks imminent).")
                 else:
                     for _mk in swp_markets:
                         cash = swp_cash.get(_mk) or 0.0
@@ -1562,36 +1579,54 @@ with tab_swp:
                                  if c["Market"] == _mk and c["price"]]
                         if not cands:
                             st.info(
-                                f"**{_mk}:** no bullish holding with a low reversal "
-                                "score to SIP into right now.")
+                                f"**{_mk}:** no bullish (low-score) or reversal-"
+                                "imminent holding to SIP into right now.")
                             continue
-                        # Diversified (equal-weight) + conviction (score/EMA/freshness)
-                        # allocation, water-filled under a per-name cap so the cash
-                        # spreads across sectors instead of piling into one name.
-                        n = len(cands)
-                        tot_w = sum(c["weight"] for c in cands) or 1.0
-                        fracs = {id(c): 0.5 / n + 0.5 * c["weight"] / tot_w
-                                 for c in cands}
-                        cap = max(0.40, 1.0 / n)
-                        for _ in range(12):
-                            excess = 0.0
-                            under = []
-                            for c in cands:
-                                k = id(c)
-                                if fracs[k] > cap + 1e-9:
-                                    excess += fracs[k] - cap
-                                    fracs[k] = cap
-                                else:
-                                    under.append(c)
-                            if excess <= 1e-9 or not under:
-                                break
-                            tu = sum(fracs[id(c)] for c in under) or 1.0
-                            for c in under:
-                                fracs[id(c)] += excess * fracs[id(c)] / tu
+                        bull_cands = [c for c in cands
+                                      if not c.get("reversal_starter")]
+                        rev_cands = [c for c in cands if c.get("reversal_starter")]
+
+                        alloc_by = {}
+                        # (1) Reversal starters (bearish + very-high score) share a
+                        #     small bounded bucket so each stays "starter" size.
+                        if rev_cands:
+                            rev_pool = cash * 0.15
+                            twr = sum(c["weight"] for c in rev_cands) or 1.0
+                            for c in rev_cands:
+                                a = rev_pool * c["weight"] / twr
+                                alloc_by[id(c)] = min(a, cash * 0.05)  # ≤5% each
+                        remaining = cash - sum(alloc_by.values())
+
+                        # (2) Bullish low-score names split the remaining cash with a
+                        #     diversified (equal-weight) + conviction water-fill under
+                        #     a per-name cap so cash spreads across sectors.
+                        if bull_cands:
+                            n = len(bull_cands)
+                            tot_w = sum(c["weight"] for c in bull_cands) or 1.0
+                            fracs = {id(c): 0.5 / n + 0.5 * c["weight"] / tot_w
+                                     for c in bull_cands}
+                            cap = max(0.40, 1.0 / n)
+                            for _ in range(12):
+                                excess = 0.0
+                                under = []
+                                for c in bull_cands:
+                                    k = id(c)
+                                    if fracs[k] > cap + 1e-9:
+                                        excess += fracs[k] - cap
+                                        fracs[k] = cap
+                                    else:
+                                        under.append(c)
+                                if excess <= 1e-9 or not under:
+                                    break
+                                tu = sum(fracs[id(c)] for c in under) or 1.0
+                                for c in under:
+                                    fracs[id(c)] += excess * fracs[id(c)] / tu
+                            for c in bull_cands:
+                                alloc_by[id(c)] = remaining * fracs[id(c)]
 
                         sip_rows = []
                         for c in cands:
-                            alloc = cash * fracs[id(c)]
+                            alloc = alloc_by.get(id(c), 0.0)
                             sh = int(alloc // c["price"]) if c["price"] else 0
                             spend = round(sh * c["price"], 2)
                             add_pct = (round(spend / c["existing_value"] * 100, 1)
@@ -1600,6 +1635,7 @@ with tab_swp:
                                 "_spend": spend,
                                 "Ticker": tradingview_url(c["yf"]),
                                 "Symbol": c["Symbol"],
+                                "Trend": c.get("trend"),
                                 "Reversal Score": c["score"],
                                 "10-EMA dist %": c["ema_dist"],
                                 "SIP tier": c["tier"] + ("" if c["fresh"]
@@ -1663,11 +1699,14 @@ with tab_swp:
                         "score < 55 gets a base weight (Strong < 20, SIP < 40, Light "
                         "< 55), multiplied by a **10-day EMA** factor (×1.25 at/below "
                         "the EMA, fading to ×0.4 when > 5% extended) and a **freshness** "
-                        "factor (×0.5 if already bought this bar). Cash is then split "
-                        "**50% equally across sectors** (diversification) and **50% by "
-                        "conviction**, capped per name so no single sector hogs the "
-                        "deployment. **Add %** = deploy ÷ your existing position. "
-                        "Educational info, not investment advice."
+                        "factor (×0.5 if already bought this bar). Bullish cash is then "
+                        "split **50% equally across sectors** (diversification) and "
+                        "**50% by conviction**, capped per name so no single sector hogs "
+                        "the deployment. A **reversal starter** bucket (max **15%** of "
+                        "cash, **≤ 5%** per name) is set aside first for **bearish** "
+                        "names whose reversal-to-Bull score is **≥ 90** — a small "
+                        "position ahead of a likely bear→bull flip. **Add %** = deploy ÷ "
+                        "your existing position. Educational info, not investment advice."
                     )
 
 
