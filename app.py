@@ -85,6 +85,16 @@ def load_frames(ticker: str) -> dict:
     return cached_ohlcv(ticker)
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def st_reversal_cached(ticker: str) -> dict:
+    """MTF Supertrend reversal read for any ticker (all combos), cached 15 min.
+    Same data the Supertrend Reversal tab uses (``mtf_supertrend_all``)."""
+    try:
+        return mtf_supertrend_all(load_frames(ticker)) or {}
+    except Exception:
+        return {}
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def ticker_is_valid(ticker: str) -> bool:
     """Quick check that yfinance returns any recent data for a ticker."""
@@ -1217,8 +1227,9 @@ def _days_held(hist) -> int:
 
 
 SHOW_SIP_TAB = False  # SIP & Exit Plan tab hidden; flip to True to restore it
-tab_swp, tab_st, tab_exit, tab_trigger, tab1, tab2, tab3, tab_rate, tab_life, tab_flows, tab4, tab5, tab6, tab7, tab_alerts = st.tabs(
+tab_swp, tab_st, tab_dump, tab_watch, tab_exit, tab_trigger, tab1, tab2, tab3, tab_rate, tab_life, tab_flows, tab4, tab5, tab6, tab7, tab_alerts = st.tabs(
     ["🏧 SWP Exit — Supertrend", "🔀 Supertrend Reversal",
+     "📥 Dump Screen — Supertrend", "⭐ Watchlist — Supertrend",
      "🎯 Exit plan — your holdings", "⚡ Breakout Trigger",
      "🚀 Breakout Candidates", "💰 Allocation", "🔴 Exit Watch", "⭐ Rate My List",
      "🔄 Sector Lifecycle", "🏦 Institutional Flows", "🔎 Details", "🔁 52W-High Retest",
@@ -2183,6 +2194,273 @@ with tab_exit:
                 "rest if it breaks below. Educational info, not investment advice."
             )
 
+
+
+# ============ Stock-list Supertrend screeners (Dump / Watchlist tabs) ============
+# These two tabs screen an arbitrary NSE stock list from an Excel/CSV export and
+# rank every name by the SAME MTF Supertrend reversal-score algorithm the
+# "Supertrend Reversal" tab uses. They are independent of the ETF scan, so they
+# live before the scan-ready gate below.
+
+def _st_score_color(score):
+    if score is None:
+        return ""
+    if score >= 70:
+        return "#1e7d46"
+    if score >= 50:
+        return "#3f7d46"
+    if score >= 30:
+        return "#b3952f"
+    return "#5a5f64"
+
+
+def _st_entry_guidance(trend, score):
+    """Entry/SIP guidance from anchor trend + reversal score (mirrors the
+    Supertrend Reversal tab). Returns ``{'pct': int, 'label': str}``."""
+    if score is None:
+        return {"pct": 0, "label": "—"}
+    is_bull = isinstance(trend, str) and "Bull" in trend
+    if is_bull:
+        if score < 20:
+            return {"pct": 30, "label": "🟢 Strong SIP"}
+        if score < 40:
+            return {"pct": 20, "label": "🟢 SIP"}
+        if score < 55:
+            return {"pct": 10, "label": "🟡 Light SIP"}
+        return {"pct": 0, "label": "⏸️ Hold — reversal risk"}
+    if score >= 80:
+        return {"pct": 20, "label": "🟢 Reversal SIP — bull flip imminent"}
+    if score >= 65:
+        return {"pct": 12, "label": "🟡 Starter SIP — reversal building"}
+    if score >= 55:
+        return {"pct": 6, "label": "🟠 Early nibble — reversal early"}
+    return {"pct": 0, "label": "🚫 Avoid — downtrend"}
+
+
+def _resolve_default_file(path, folder_glob):
+    """Use ``path`` if it exists; otherwise fall back to the newest file matching
+    ``folder_glob`` in the same folder (handles weekly-dated exports)."""
+    if path and os.path.exists(path):
+        return path
+    try:
+        import glob
+        folder = os.path.dirname(path) if path else ""
+        if folder and os.path.isdir(folder) and folder_glob:
+            cands = sorted(glob.glob(os.path.join(folder, folder_glob)),
+                           key=os.path.getmtime, reverse=True)
+            if cands:
+                return cands[0]
+    except Exception:
+        pass
+    return path
+
+
+def _extract_stock_symbols(src):
+    """Read an Excel/CSV export and return the NSE symbols from the sheet whose
+    'Symbol' column has the most entries. Returns ``(symbols, error)``."""
+    try:
+        name = src if isinstance(src, str) else getattr(src, "name", "")
+        if str(name).lower().endswith(".csv"):
+            book = {"_": pd.read_csv(src)}
+        else:
+            book = pd.read_excel(src, sheet_name=None)
+    except Exception as exc:
+        return [], str(exc)
+    best = []
+    best_pri = -1
+    for _sh, df in book.items():
+        if df is None or df.empty:
+            continue
+        symcol = None
+        for c in df.columns:
+            k = str(c).strip().lower().replace("\n", "")
+            if k == "symbol" or k.startswith("symbol"):
+                symcol = c
+                break
+        if symcol is None:
+            continue
+        vals = []
+        for v in df[symcol].dropna().astype(str):
+            v = v.strip().upper().replace("\n", "")
+            if v and v not in ("SYMBOL", "NAN"):
+                vals.append(v)
+        # Prefer the main TradingView export sheet ("Dump of stocks_<date>") over
+        # the auxiliary corporate-action sheets; break ties by symbol count.
+        pri = 1 if str(_sh).strip().lower().startswith("dump of stocks") else 0
+        if (pri, len(vals)) > (best_pri, len(best)):
+            best, best_pri = vals, pri
+    seen, out = set(), []
+    for v in best:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out, None
+
+
+def render_stock_screen(default_path, folder_glob, key_prefix, heading, blurb):
+    st.subheader(heading)
+    st.caption(blurb)
+    st_combo = ST_STACK_MAP.get(tuple(selected_tf), "1h+2h+4h+1d")
+    anchor_tf = ST_COMBOS[st_combo][-1]
+    st.info(
+        f"⏱️ Ranking on stack **{st_combo}** (anchor **{anchor_tf}**) — the same "
+        "Supertrend reversal-score algorithm as the **Supertrend Reversal** tab. "
+        "Change the stack from the sidebar **Timeframe** control (pick an *MTF …* "
+        "option). **Higher score = the anchor trend is more likely to reverse soon.**"
+    )
+    resolved = _resolve_default_file(default_path, folder_glob)
+    up = st.file_uploader("Upload the stock list (Excel / CSV)",
+                          type=["xlsx", "xls", "csv"], key=f"{key_prefix}_upl")
+    path = st.text_input("…or read from this path", value=resolved,
+                         key=f"{key_prefix}_path")
+    src = up if up is not None else (path if (path and os.path.exists(path)) else None)
+    if src is None:
+        st.warning("Upload a file, or enter a valid path above, to screen the list.")
+        return
+    symbols, err = _extract_stock_symbols(src)
+    if err:
+        st.error(f"Could not read the file: {err}")
+        return
+    if not symbols:
+        st.error("No **Symbol** column found in the file.")
+        return
+    src_label = getattr(up, "name", None) or os.path.basename(path)
+    st.caption(f"📄 **{src_label}** — found **{len(symbols)}** NSE symbols.")
+    c1, c2, c3 = st.columns([3, 1, 1])
+    n = c1.slider("Symbols to screen (from the top of the list)", 5,
+                  int(min(len(symbols), 200)), int(min(30, len(symbols))),
+                  key=f"{key_prefix}_n",
+                  help="Each symbol needs multi-timeframe data (~1–2s each). Start "
+                  "small, then increase. Results are cached 15 min.")
+    only_actionable = c2.checkbox("Actionable only", value=False,
+                                  key=f"{key_prefix}_act",
+                                  help="Hide Hold / Avoid rows (show only SIP names).")
+    run = c3.button("▶️ Run screen", key=f"{key_prefix}_run", type="primary")
+
+    rows_key, sig_key, fails_key = (f"{key_prefix}_rows", f"{key_prefix}_sig",
+                                    f"{key_prefix}_fails")
+    sig = f"{src_label}|{st_combo}|{n}"
+    if run:
+        rows, fails = [], 0
+        subset = symbols[:n]
+        prog = st.progress(0.0, text="Scoring…")
+        for i, sy in enumerate(subset):
+            tk = sy if sy.upper().endswith(".NS") else f"{sy}.NS"
+            data = st_reversal_cached(tk).get(st_combo)
+            if data and data.get("score") is not None:
+                score = data.get("score")
+                da = data.get("dist_atr")
+                entry = _st_entry_guidance(data.get("trend"), score)
+                rows.append({
+                    "_score": score, "_color": _st_score_color(score),
+                    "_pct": entry["pct"],
+                    "Ticker": tradingview_url(tk), "Symbol": sy,
+                    "Trend": data.get("trend"),
+                    "SIP action": entry["label"], "SIP %": entry["pct"],
+                    "Reversal Score": score,
+                    "Reversal to": data.get("reversal_to"),
+                    "Score 1w ago": data.get("score_1w"),
+                    "Score 2w ago": data.get("score_2w"),
+                    "Stack": data.get("stack"),
+                    "Dist-to-flip (ATR)": round(da, 2) if da is not None else None,
+                })
+            else:
+                fails += 1
+            prog.progress((i + 1) / len(subset),
+                          text=f"Scored {i + 1}/{len(subset)}  ·  {sy}")
+        prog.empty()
+        st.session_state[rows_key] = rows
+        st.session_state[sig_key] = sig
+        st.session_state[fails_key] = fails
+
+    rows = st.session_state.get(rows_key)
+    if rows is None:
+        st.info("Click **▶️ Run screen** to score and rank the list.")
+        return
+    if st.session_state.get(sig_key) != sig:
+        st.warning("Settings changed since the last run — click **▶️ Run screen** "
+                   "to refresh.")
+    fails = st.session_state.get(fails_key, 0)
+    if not rows:
+        st.error(f"No Supertrend data returned for the screened symbols "
+                 f"({fails} had no data — check the symbols are valid NSE tickers).")
+        return
+    if only_actionable:
+        rows = [r for r in rows if r["_pct"] > 0]
+    st.success(
+        f"✅ Ranked **{len(rows)}** symbols on the {st_combo} Supertrend reversal "
+        f"score" + (f" · {fails} skipped (no data)" if fails else ""))
+
+    colcfg = {
+        "_score": None, "_color": None, "_pct": None,
+        "Ticker": st.column_config.LinkColumn(
+            "Ticker", display_text=r"symbol=(.+)$"),
+        "Reversal Score": st.column_config.ProgressColumn(
+            "Reversal Score", help="0–100. Higher = the anchor trend is more "
+            "likely to reverse soon (weighted lower-TF flip cascade + ATR "
+            "proximity).", min_value=0, max_value=100, format="%d"),
+        "SIP action": st.column_config.TextColumn(
+            "SIP action", help="Entry guidance: bullish + low score (uptrend "
+            "intact) or bearish + very-high score (bull flip imminent)."),
+        "SIP %": st.column_config.NumberColumn("SIP %", format="%d%%"),
+        "Score 1w ago": st.column_config.NumberColumn("Score 1w ago", format="%d"),
+        "Score 2w ago": st.column_config.NumberColumn("Score 2w ago", format="%d"),
+        "Dist-to-flip (ATR)": st.column_config.NumberColumn(
+            "Dist-to-flip (ATR)", help="How far the anchor price is from its "
+            "Supertrend flip line, in ATRs. Smaller = riper for a flip.",
+            format="%.2f"),
+    }
+
+    def _color_rows(row):
+        c = row["_color"]
+        s = (f"background-color: {c}; color: #ffffff; font-weight: 600"
+             if c else "")
+        return [s] * len(row)
+
+    def _tbl(group, title, cap, ascending, suffix):
+        st.markdown(f"#### {title}")
+        if not group:
+            st.caption("_None in this group._")
+            return
+        st.caption(cap)
+        g = (pd.DataFrame(group).sort_values("_score", ascending=ascending)
+             .reset_index(drop=True))
+        g.insert(0, "Rank", range(1, len(g) + 1))
+        st.dataframe(g.style.apply(_color_rows, axis=1), use_container_width=True,
+                     hide_index=True, column_config=colcfg)
+        st.download_button(
+            "⬇️ Download CSV",
+            g.drop(columns=["_score", "_color", "_pct"]).to_csv(index=False).encode(),
+            file_name=f"{key_prefix}_{suffix}_{st_combo.replace('+', '-')}.csv",
+            mime="text/csv", key=f"{key_prefix}_dl_{suffix}")
+
+    bull = [r for r in rows if "Bull" in (r["Trend"] or "")]
+    bear = [r for r in rows if "Bull" not in (r["Trend"] or "")]
+    _tbl(bull, f"🟢 Bullish trend ({len(bull)})",
+         "Uptrend intact — **ascending** by reversal score: lowest reversal risk "
+         "(strongest SIP) first.", True, "bull")
+    _tbl(bear, f"🔴 Bearish trend ({len(bear)})",
+         "Downtrend — **descending** by reversal score: closest to a bull flip "
+         "(reversal-starter candidates) first.", False, "bear")
+    st.caption("Educational info, not investment advice.")
+
+
+with tab_dump:
+    render_stock_screen(
+        r"C:\Users\ajaysingla\OneDrive\msft_backup\AJAY\stocks\InHouse_Stock_Screener\Dump of stocks_8th August 2026.xlsx",
+        "Dump of stocks_*.xlsx", "dump",
+        "📥 Dump Screen — Supertrend ranking",
+        "Screen a full **stock dump** (e.g. a TradingView export) and rank every "
+        "name by the MTF Supertrend reversal score — the same algorithm as the "
+        "**Supertrend Reversal** tab.")
+
+with tab_watch:
+    render_stock_screen(
+        r"C:\Users\ajaysingla\OneDrive\msft_backup\AJAY\stocks\InHouse_Stock_Screener\Watchlist Friendship Day 2026.xlsx",
+        "Watchlist*.xlsx", "watch",
+        "⭐ Watchlist — Supertrend ranking",
+        "Screen your **curated watchlist** and rank names by the MTF Supertrend "
+        "reversal score — the same algorithm as the **Supertrend Reversal** tab.")
 
 
 # --- Gate: scanner tabs need a scan; the Exit-plan tab above does not ---
