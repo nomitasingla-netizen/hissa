@@ -1227,9 +1227,10 @@ def _days_held(hist) -> int:
 
 
 SHOW_SIP_TAB = False  # SIP & Exit Plan tab hidden; flip to True to restore it
-tab_swp, tab_st, tab_dump, tab_watch, tab_exit, tab_trigger, tab1, tab2, tab3, tab_rate, tab_life, tab_flows, tab4, tab5, tab6, tab7, tab_alerts = st.tabs(
+tab_swp, tab_st, tab_dump, tab_watch, tab_ipo_ath, tab_exit, tab_trigger, tab1, tab2, tab3, tab_rate, tab_life, tab_flows, tab4, tab5, tab6, tab7, tab_alerts = st.tabs(
     ["🏧 SWP Exit — Supertrend", "🔀 Supertrend Reversal",
      "📥 Dump Screen — Supertrend", "⭐ Watchlist — Supertrend",
+     "🏆 IPO near ATH — Supertrend",
      "🎯 Exit plan — your holdings", "⚡ Breakout Trigger",
      "🚀 Breakout Candidates", "💰 Allocation", "🔴 Exit Watch", "⭐ Rate My List",
      "🔄 Sector Lifecycle", "🏦 Institutional Flows", "🔎 Details", "🔁 52W-High Retest",
@@ -2237,6 +2238,28 @@ def _st_entry_guidance(trend, score):
     return {"pct": 0, "label": "🚫 Avoid — downtrend"}
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def _ipo_ath_stats(ticker: str):
+    """All-time-high stats from full daily history: ``(ath, current, pct_from_ath)``
+    where ``pct_from_ath`` is (current/ATH − 1)·100 (≤0 = below the ATH). ATH uses
+    the daily **High** series when present, else Close. Returns ``None`` on no data."""
+    try:
+        d = cached_ohlcv(ticker).get("1d", pd.DataFrame())
+    except Exception:
+        return None
+    if d is None or d.empty or "Close" not in d:
+        return None
+    close = d["Close"].dropna()
+    if close.empty:
+        return None
+    high = d["High"].dropna() if "High" in d.columns else close
+    ath = float(max(high.max(), close.max()))
+    current = float(close.iloc[-1])
+    if ath <= 0:
+        return None
+    return ath, current, (current / ath - 1.0) * 100.0
+
+
 def _resolve_default_file(path, folder_glob):
     """Use ``path`` if it exists; otherwise fall back to the newest file matching
     ``folder_glob`` in the same folder (handles weekly-dated exports)."""
@@ -2463,7 +2486,193 @@ with tab_watch:
         "reversal score — the same algorithm as the **Supertrend Reversal** tab.")
 
 
-# --- Gate: scanner tabs need a scan; the Exit-plan tab above does not ---
+with tab_ipo_ath:
+    st.subheader("🏆 Recent IPOs trading near their all-time high — Supertrend rank")
+    st.caption(
+        "Screens **NSE IPOs listed within your chosen window** (fetched live from the "
+        "official NSE past-issues API), keeps only those trading **close to their "
+        "all-time high** (within the ± band you set), and rates each by the **MTF "
+        "Supertrend reversal score** — the same algorithm as the **Supertrend "
+        "Reversal** tab. A young stock riding near its ATH with a **low** reversal "
+        "score is a fresh leader whose uptrend is still intact; the **% from ATH** "
+        "column shows exactly how far below its peak each name is trading."
+    )
+    st_combo = ST_STACK_MAP.get(tuple(selected_tf), "1h+2h+4h+1d")
+    anchor_tf = ST_COMBOS[st_combo][-1]
+    st.info(
+        f"⏱️ Ranking on stack **{st_combo}** (anchor **{anchor_tf}**). Change it from "
+        "the sidebar **Timeframe** control (pick an *MTF …* option). **Higher reversal "
+        "score = the anchor trend is more likely to reverse soon** (i.e. a near-ATH "
+        "name with a **high** score may be topping)."
+    )
+
+    ia = st.columns([1.2, 1.5, 1.1])
+    _ipo_ath_ranges = {"6 months": 180, "1 year": 365, "2 years": 730}
+    with ia[0]:
+        ipoath_win = st.selectbox("IPO listed within", list(_ipo_ath_ranges.keys()),
+                                  index=1, key="ipoath_win")
+    with ia[1]:
+        ipoath_band = st.slider("Near ATH — within ± % of all-time high", 1, 30, 10, 1,
+                                key="ipoath_band",
+                                help="Keep names whose current price is within this "
+                                "percent of their all-time high.")
+    with ia[2]:
+        ipoath_board = st.selectbox("Board", ["All", "Mainboard", "SME"],
+                                    key="ipoath_board")
+
+    run_ipoath = st.button("▶️ Fetch & rank near-ATH IPOs", type="primary",
+                           key="ipoath_run")
+
+    if run_ipoath:
+        within_days = _ipo_ath_ranges[ipoath_win]
+        try:
+            with st.spinner("Fetching recent IPOs from NSE…"):
+                ipo_list = cached_recent_ipos(within_days)
+        except Exception as exc:
+            st.error(
+                "Couldn't fetch the IPO list from NSE right now "
+                f"({type(exc).__name__}). NSE may be rate-limiting — try again shortly."
+            )
+            ipo_list = None
+
+        if ipo_list is not None:
+            if ipoath_board != "All":
+                ipo_list = [r for r in ipo_list if r.get("board") == ipoath_board]
+            band = float(ipoath_band)
+            rows, near, no_data = [], 0, 0
+            total = max(1, len(ipo_list))
+            prog = st.progress(0.0, text="Screening near-ATH IPOs…")
+            for i, r in enumerate(ipo_list, start=1):
+                sym = r["symbol"]
+                prog.progress(i / total, text=f"Checking {sym} ({i}/{total})")
+                tk = f"{sym}.NS"
+                stats = _ipo_ath_stats(tk)
+                if stats is None:
+                    no_data += 1
+                    continue
+                ath, current, pct_from_ath = stats
+                if abs(pct_from_ath) > band:
+                    continue
+                near += 1
+                data = st_reversal_cached(tk).get(st_combo)
+                if not data or data.get("score") is None:
+                    no_data += 1
+                    continue
+                score = data.get("score")
+                da = data.get("dist_atr")
+                entry = _st_entry_guidance(data.get("trend"), score)
+                rows.append({
+                    "_score": score, "_color": _st_score_color(score),
+                    "_pct": entry["pct"],
+                    "Ticker": tradingview_url(tk), "Symbol": sym,
+                    "Company": r.get("company", ""),
+                    "Board": r.get("board", ""),
+                    "Listed": str(r["listing_date"]), "Days": r["days_since"],
+                    "Trend": data.get("trend"),
+                    "SIP action": entry["label"], "SIP %": entry["pct"],
+                    "Reversal Score": score,
+                    "Reversal to": data.get("reversal_to"),
+                    "ATH ₹": round(ath, 2), "Now ₹": round(current, 2),
+                    "% from ATH": round(pct_from_ath, 1),
+                    "Score 1w ago": data.get("score_1w"),
+                    "Score 2w ago": data.get("score_2w"),
+                    "Stack": data.get("stack"),
+                    "Dist-to-flip (ATR)": round(da, 2) if da is not None else None,
+                })
+            prog.empty()
+            st.session_state["ipoath_rows"] = rows
+            st.session_state["ipoath_sig"] = f"{ipoath_win}|{band}|{ipoath_board}|{st_combo}"
+            st.session_state["ipoath_meta"] = {
+                "total": len(ipo_list), "near": near, "no_data": no_data,
+                "win": ipoath_win, "band": band, "combo": st_combo,
+            }
+
+    ath_rows = st.session_state.get("ipoath_rows")
+    if ath_rows is None:
+        st.info("👆 Click **Fetch & rank near-ATH IPOs** to pull the NSE IPO list, "
+                "keep the ones trading near their all-time high, and score them.")
+    elif not ath_rows:
+        m = st.session_state.get("ipoath_meta", {})
+        st.warning(
+            f"Scanned **{m.get('total', 0)}** IPOs from the last **{m.get('win', '')}** — "
+            f"none are trading within **±{int(m.get('band', ipoath_band))}%** of their "
+            "all-time high with Supertrend data. Widen the band or the listing window."
+        )
+    else:
+        m = st.session_state.get("ipoath_meta", {})
+        cur_sig = f"{ipoath_win}|{float(ipoath_band)}|{ipoath_board}|{st_combo}"
+        if st.session_state.get("ipoath_sig") != cur_sig:
+            st.warning("Settings changed since the last run — click **Fetch & rank "
+                       "near-ATH IPOs** to refresh.")
+        st.success(
+            f"✅ **{len(ath_rows)}** IPOs from the last **{m.get('win', '')}** are within "
+            f"**±{int(m.get('band', ipoath_band))}%** of their all-time high, ranked on "
+            f"the **{m.get('combo', st_combo)}** Supertrend reversal score "
+            f"(scanned {m.get('total', 0)}, {m.get('near', 0)} near ATH)."
+        )
+
+        ath_colcfg = {
+            "_score": None, "_color": None, "_pct": None,
+            "Ticker": st.column_config.LinkColumn(
+                "Ticker", display_text=r"symbol=(.+)$"),
+            "Reversal Score": st.column_config.ProgressColumn(
+                "Reversal Score", help="0–100. Higher = the anchor trend is more "
+                "likely to reverse soon.", min_value=0, max_value=100, format="%d"),
+            "% from ATH": st.column_config.NumberColumn(
+                "% from ATH", help="Current price vs all-time high "
+                "(0% = at the high, −5% = 5% below it).", format="%.1f%%"),
+            "ATH ₹": st.column_config.NumberColumn("ATH ₹", format="%.2f"),
+            "Now ₹": st.column_config.NumberColumn("Now ₹", format="%.2f"),
+            "SIP action": st.column_config.TextColumn(
+                "SIP action", help="Entry guidance from anchor trend + reversal score."),
+            "SIP %": st.column_config.NumberColumn("SIP %", format="%d%%"),
+            "Score 1w ago": st.column_config.NumberColumn("Score 1w ago", format="%d"),
+            "Score 2w ago": st.column_config.NumberColumn("Score 2w ago", format="%d"),
+            "Dist-to-flip (ATR)": st.column_config.NumberColumn(
+                "Dist-to-flip (ATR)", help="Distance of the anchor price from its "
+                "Supertrend flip line, in ATRs. Smaller = riper for a flip.",
+                format="%.2f"),
+        }
+
+        def _ath_color_rows(row):
+            c = row["_color"]
+            s = (f"background-color: {c}; color: #ffffff; font-weight: 600"
+                 if c else "")
+            return [s] * len(row)
+
+        def _ath_tbl(group, title, cap, ascending, suffix):
+            st.markdown(f"#### {title}")
+            if not group:
+                st.caption("_None in this group._")
+                return
+            st.caption(cap)
+            g = (pd.DataFrame(group).sort_values("_score", ascending=ascending)
+                 .reset_index(drop=True))
+            g.insert(0, "Rank", range(1, len(g) + 1))
+            st.dataframe(g.style.apply(_ath_color_rows, axis=1),
+                         use_container_width=True, hide_index=True,
+                         column_config=ath_colcfg)
+            st.download_button(
+                "⬇️ Download CSV",
+                g.drop(columns=["_score", "_color", "_pct"]).to_csv(index=False).encode(),
+                file_name=f"ipo_near_ath_{suffix}_{st_combo.replace('+', '-')}.csv",
+                mime="text/csv", key=f"ipoath_dl_{suffix}")
+
+        bull = [r for r in ath_rows if "Bull" in (r["Trend"] or "")]
+        bear = [r for r in ath_rows if "Bull" not in (r["Trend"] or "")]
+        _ath_tbl(bull, f"🟢 Bullish trend ({len(bull)})",
+                 "Uptrend intact near the ATH — **ascending** by reversal score: "
+                 "lowest reversal risk (strongest fresh leader) first.", True, "bull")
+        _ath_tbl(bear, f"🔴 Bearish trend ({len(bear)})",
+                 "Rolling over near the highs — **descending** by reversal score: "
+                 "closest to a bull flip first.", False, "bear")
+        st.caption(
+            "ATH = highest daily high in the available history (recent IPOs, so this "
+            "is effectively the post-listing peak). Very new IPOs without yfinance "
+            "history are skipped. Educational info, not investment advice.")
+
+
+# --- Gate: scanner tabs need a scan; the tabs above do not ---
 if not scan_ready:
     st.stop()
 
