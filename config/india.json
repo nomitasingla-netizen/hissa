@@ -27,6 +27,8 @@
     "360ONE.NS": "360ONE",
     "Pharmabees.NS": "Pharmabees",
     "BSE.NS": "BSE",
-    "CDSL.NS":"CDSL"	
+    "CDSL.NS":"CDSL",
+    "SMALLCAP.NS":"SMALLCAP",
+    "GOLDBEES.NS":"GOLDBEES"	
   }
 }

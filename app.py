@@ -1450,6 +1450,31 @@ with tab_swp:
                                    - pd.Timestamp(_ld).normalize()).days
                             recent_buy = _ds <= _bar_window_days(selected_tf)
                         fresh_f = 0.5 if recent_buy else 1.0
+                        # ---- Protective stop-loss (capital protection) ----
+                        # Derive the anchor-timeframe ATR from the Supertrend fields:
+                        # dist_atr = |price − flip| in ATR multiples ⇒ ATR = that ÷ dist.
+                        flip = sc.get("st_flip_price")
+                        dist_atr = sc.get("st_dist_atr")
+                        atr = (abs(price - flip) / dist_atr
+                               if (flip and dist_atr and dist_atr > 0) else None)
+                        if bull_sip:
+                            # Bullish → trail the Supertrend flip line (trend stop);
+                            # fall back to a 1.5×ATR / structure stop if it sits above.
+                            if flip and flip < price:
+                                stop_px, stop_basis = flip, "ST flip"
+                            elif atr:
+                                stop_px, stop_basis = price - 1.5 * atr, "1.5×ATR"
+                            else:
+                                stop_px, stop_basis = sc.get("stop"), "structure"
+                        else:
+                            # Reversal starter (bearish) → tighter 1.5×ATR invalidation
+                            # (catching a falling knife: cut it if it keeps dropping).
+                            if atr:
+                                stop_px, stop_basis = price - 1.5 * atr, "1.5×ATR"
+                            else:
+                                stop_px, stop_basis = sc.get("stop"), "structure"
+                        risk_pct = (round((price - stop_px) / price * 100, 1)
+                                    if (stop_px and price and stop_px < price) else None)
                         sip_candidates.append({
                             "yf": p["yf"], "Symbol": p["symbol"], "Market": p["market"],
                             "price": price, "score": score, "ema_dist": ema_dist,
@@ -1457,6 +1482,8 @@ with tab_swp:
                             "existing_value": round((qty or 0) * price, 2),
                             "weight": tier_w * ema_f * fresh_f,
                             "tier": tier_lbl, "fresh": not recent_buy,
+                            "stop_px": stop_px, "stop_basis": stop_basis,
+                            "risk_pct": risk_pct,
                         })
 
                     swp_rows.append({
@@ -1631,8 +1658,15 @@ with tab_swp:
                             spend = round(sh * c["price"], 2)
                             add_pct = (round(spend / c["existing_value"] * 100, 1)
                                        if c.get("existing_value") else None)
+                            stop_px = c.get("stop_px")
+                            # Capital at risk on this entry = shares × (entry − stop).
+                            risk_amt = (round(sh * (c["price"] - stop_px), 2)
+                                        if (sh and stop_px and stop_px < c["price"])
+                                        else None)
+                            stop_lbl = (round(stop_px, 2) if stop_px else None)
                             sip_rows.append({
                                 "_spend": spend,
+                                "_risk": risk_amt or 0.0,
                                 "Ticker": tradingview_url(c["yf"]),
                                 "Symbol": c["Symbol"],
                                 "Trend": c.get("trend"),
@@ -1645,25 +1679,34 @@ with tab_swp:
                                 "Buy shares": sh,
                                 f"Deploy {msym}": spend,
                                 "Price": c["price"],
+                                "Stop @": stop_lbl,
+                                "Stop basis": c.get("stop_basis"),
+                                "Risk %": c.get("risk_pct"),
+                                f"Risk {msym}": risk_amt,
                             })
                         deployed = sum(r["_spend"] for r in sip_rows)
+                        risk_tot = sum(r["_risk"] for r in sip_rows)
                         n_dep = sum(1 for r in sip_rows if r["_spend"] > 0)
                         top = " · ".join(
                             f"**{r['Symbol']}** {msym}{r['_spend']:,.0f}"
                             for r in sorted(sip_rows, key=lambda x: x["_spend"],
                                             reverse=True)[:6] if r["_spend"] > 0)
                         if n_dep:
+                            rk = (f" · max risk to stops **{msym}{risk_tot:,.0f}** "
+                                  f"({risk_tot / deployed * 100:.0f}% of deployed)"
+                                  if deployed else "")
                             st.success(
                                 f"💧 **{_mk} — SIP {msym}{deployed:,.0f} of "
                                 f"{msym}{cash:,.0f} ({deployed / cash * 100:.0f}%) "
-                                f"across {n_dep} sector(s):** {top}")
+                                f"across {n_dep} sector(s):** {top}{rk}")
                         else:
                             st.info(
                                 f"**{_mk}:** cash too small to buy a full share of any "
                                 "candidate at current prices.")
                         sip_df = (pd.DataFrame(sip_rows)
                                   .sort_values("_spend", ascending=False)
-                                  .drop(columns=["_spend"]).reset_index(drop=True))
+                                  .drop(columns=["_spend", "_risk"])
+                                  .reset_index(drop=True))
                         st.dataframe(
                             sip_df, use_container_width=True, hide_index=True,
                             column_config={
@@ -1687,6 +1730,20 @@ with tab_swp:
                                 f"Existing {msym}": st.column_config.NumberColumn(
                                     f"Existing {msym}", format="%.0f"),
                                 "Price": st.column_config.NumberColumn("Price", format="%.2f"),
+                                "Stop @": st.column_config.NumberColumn(
+                                    "Stop @", help="Protective stop-loss for this entry. "
+                                    "Bullish → the Supertrend flip line (trailing trend "
+                                    "stop); reversal starter → entry − 1.5×ATR.",
+                                    format="%.2f"),
+                                "Risk %": st.column_config.NumberColumn(
+                                    "Risk %", help="Downside from entry to the protective "
+                                    "stop (bullish: Supertrend flip / trend stop; "
+                                    "reversal starter: entry − 1.5×ATR).",
+                                    format="%.1f%%"),
+                                f"Risk {msym}": st.column_config.NumberColumn(
+                                    f"Risk {msym}", help="Capital at risk on this entry "
+                                    "if the stop is hit = shares × (entry − stop).",
+                                    format="%.0f"),
                             },
                         )
                         st.download_button(
@@ -1706,7 +1763,12 @@ with tab_swp:
                         "cash, **≤ 5%** per name) is set aside first for **bearish** "
                         "names whose reversal-to-Bull score is **≥ 90** — a small "
                         "position ahead of a likely bear→bull flip. **Add %** = deploy ÷ "
-                        "your existing position. Educational info, not investment advice."
+                        "your existing position. **Capital protection:** every entry "
+                        "carries a **stop-loss** — bullish names trail the **Supertrend "
+                        "flip line** (trend stop), reversal starters use **entry − "
+                        "1.5×ATR**; the **Risk %** and **Risk** columns show the downside "
+                        "and cash at risk if the stop is hit. Educational info, not "
+                        "investment advice."
                     )
 
 
