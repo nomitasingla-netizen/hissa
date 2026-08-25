@@ -15,7 +15,7 @@ from core.data import fetch_ohlcv, truncate_frames, get_fund_info
 import core.etfs as etfs
 import core.stocks as stocks
 from core.etfs import MARKETS, LOAD_ERRORS
-from core.scoring import score_sector, breakout_snapshot, imminence_snapshot, score_snapshot, lifecycle_stage, PRIMARY_ORDER, mtf_supertrend_all, ST_COMBOS
+from core.scoring import score_sector, breakout_snapshot, imminence_snapshot, score_snapshot, lifecycle_stage, PRIMARY_ORDER, mtf_supertrend_all, ST_COMBOS, supertrend_reversal, _frames_back, ST_LOOKBACK
 from core.patterns import detect_breakout_retest
 import core.ipos as ipos
 import core.alerts as alertmod
@@ -93,6 +93,31 @@ def st_reversal_cached(ticker: str) -> dict:
         return mtf_supertrend_all(load_frames(ticker)) or {}
     except Exception:
         return {}
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def st_reversal_tf_cached(ticker: str, tfs: tuple) -> dict | None:
+    """Supertrend reversal for the **exact** timeframe stack selected in the
+    sidebar (not just the predefined MTF combos), including the score 1w/2w ago.
+    Anchor = the last timeframe in ``tfs``. Returns the reversal dict or None."""
+    try:
+        frames = load_frames(ticker)
+        cur = supertrend_reversal(frames, list(tfs))
+        if cur is None:
+            return None
+        p1 = supertrend_reversal(_frames_back(frames, ST_LOOKBACK["1w"]), list(tfs))
+        p2 = supertrend_reversal(_frames_back(frames, ST_LOOKBACK["2w"]), list(tfs))
+        cur["score_1w"] = p1["score"] if p1 else None
+        cur["score_2w"] = p2["score"] if p2 else None
+        return cur
+    except Exception:
+        return None
+
+
+def _tf_stack_label(tfs) -> str:
+    """Human label for a timeframe stack, e.g. ('1h','2h','4h','1d') → '1h+2h+4h+1d',
+    ('1d','1wk') → '1d+1w'."""
+    return "+".join("1w" if t == "1wk" else str(t) for t in tfs)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -2323,13 +2348,14 @@ def _extract_stock_symbols(src):
 def render_stock_screen(default_path, folder_glob, key_prefix, heading, blurb):
     st.subheader(heading)
     st.caption(blurb)
-    st_combo = ST_STACK_MAP.get(tuple(selected_tf), "1h+2h+4h+1d")
-    anchor_tf = ST_COMBOS[st_combo][-1]
+    tf_stack = tuple(selected_tf)
+    st_combo = _tf_stack_label(tf_stack)
+    anchor_tf = _tf_stack_label((tf_stack[-1],))
     st.info(
-        f"⏱️ Ranking on stack **{st_combo}** (anchor **{anchor_tf}**) — the same "
-        "Supertrend reversal-score algorithm as the **Supertrend Reversal** tab. "
-        "Change the stack from the sidebar **Timeframe** control (pick an *MTF …* "
-        "option). **Higher score = the anchor trend is more likely to reverse soon.**"
+        f"⏱️ Ranking on the sidebar timeframe stack **{st_combo}** (anchor "
+        f"**{anchor_tf}**) — the same Supertrend reversal-score algorithm as the "
+        "**Supertrend Reversal** tab. Change the stack from the sidebar **Timeframe** "
+        "control. **Higher score = the anchor trend is more likely to reverse soon.**"
     )
     resolved = _resolve_default_file(default_path, folder_glob)
     up = st.file_uploader("Upload the stock list (Excel / CSV)",
@@ -2369,7 +2395,7 @@ def render_stock_screen(default_path, folder_glob, key_prefix, heading, blurb):
         prog = st.progress(0.0, text="Scoring…")
         for i, sy in enumerate(subset):
             tk = sy if sy.upper().endswith(".NS") else f"{sy}.NS"
-            data = st_reversal_cached(tk).get(st_combo)
+            data = st_reversal_tf_cached(tk, tf_stack)
             if data and data.get("score") is not None:
                 score = data.get("score")
                 da = data.get("dist_atr")
@@ -2497,13 +2523,14 @@ with tab_ipo_ath:
         "score is a fresh leader whose uptrend is still intact; the **% from ATH** "
         "column shows exactly how far below its peak each name is trading."
     )
-    st_combo = ST_STACK_MAP.get(tuple(selected_tf), "1h+2h+4h+1d")
-    anchor_tf = ST_COMBOS[st_combo][-1]
+    tf_stack = tuple(selected_tf)
+    st_combo = _tf_stack_label(tf_stack)
+    anchor_tf = _tf_stack_label((tf_stack[-1],))
     st.info(
-        f"⏱️ Ranking on stack **{st_combo}** (anchor **{anchor_tf}**). Change it from "
-        "the sidebar **Timeframe** control (pick an *MTF …* option). **Higher reversal "
-        "score = the anchor trend is more likely to reverse soon** (i.e. a near-ATH "
-        "name with a **high** score may be topping)."
+        f"⏱️ Ranking on the sidebar timeframe stack **{st_combo}** (anchor "
+        f"**{anchor_tf}**). Change it from the sidebar **Timeframe** control. "
+        "**Higher reversal score = the anchor trend is more likely to reverse soon** "
+        "(i.e. a near-ATH name with a **high** score may be topping)."
     )
 
     ia = st.columns([1.2, 1.5, 1.1])
@@ -2554,7 +2581,7 @@ with tab_ipo_ath:
                 if abs(pct_from_ath) > band:
                     continue
                 near += 1
-                data = st_reversal_cached(tk).get(st_combo)
+                data = st_reversal_tf_cached(tk, tf_stack)
                 if not data or data.get("score") is None:
                     no_data += 1
                     continue
