@@ -96,6 +96,20 @@ def supertrend(high: pd.Series, low: pd.Series, close: pd.Series,
             pd.Series(dir_, index=close.index))
 
 
+def chandelier_exit(high: pd.Series, low: pd.Series, close: pd.Series,
+                    period: int = 22, mult: float = 3.0):
+    """Return Chandelier long and short trailing-stop series.
+
+    The long stop is the highest high over ``period`` bars minus ``mult`` times
+    ATR(period); the short stop mirrors it from the lowest low. A completed
+    close below the long stop is the standard long-exit signal.
+    """
+    atr_ = atr(high, low, close, period)
+    long_stop = high.rolling(period, min_periods=period).max() - mult * atr_
+    short_stop = low.rolling(period, min_periods=period).min() + mult * atr_
+    return long_stop, short_stop
+
+
 def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14):
     """Return (adx, plus_di, minus_di) using Wilder's smoothing."""
     up_move = high.diff()

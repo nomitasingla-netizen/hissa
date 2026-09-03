@@ -13,6 +13,7 @@ import streamlit as st
 
 from core.data import fetch_ohlcv, truncate_frames, get_fund_info
 import core.etfs as etfs
+import core.indicators as ind
 import core.stocks as stocks
 from core.etfs import MARKETS, LOAD_ERRORS
 from core.scoring import score_sector, breakout_snapshot, imminence_snapshot, score_snapshot, lifecycle_stage, PRIMARY_ORDER, mtf_supertrend_all, ST_COMBOS, supertrend_reversal, _frames_back, ST_LOOKBACK
@@ -744,6 +745,23 @@ def score_holding_cached(ticker: str, market: str, timeframes: tuple):
     # 1D-anchored stack (the more reliable reversal anchor per backtest).
     st_combo = ST_STACK_MAP.get(tuple(timeframes), "1h+2h+4h+1d")
     st_cur = (mtf_supertrend_all(frames) or {}).get(st_combo) or {}
+    # ---- Chandelier Exit on the selected stack's anchor timeframe ----
+    # This intentionally follows the sidebar selection exactly, unlike the
+    # legacy Supertrend holding read that maps classic blends to an MTF combo.
+    ce_stop = ce_dist_atr = None
+    ce_anchor = timeframes[-1] if timeframes else None
+    ce_df = frames.get(ce_anchor) if ce_anchor else None
+    if (ce_df is not None and len(ce_df) >= 22
+            and {"High", "Low", "Close"}.issubset(ce_df.columns)):
+        ce_long, _ = ind.chandelier_exit(
+            ce_df["High"], ce_df["Low"], ce_df["Close"], period=22, mult=3.0)
+        ce_last = ce_long.iloc[-1]
+        ce_atr = ind.atr(ce_df["High"], ce_df["Low"], ce_df["Close"], 22).iloc[-1]
+        ce_price = float(ce_df["Close"].iloc[-1])
+        if pd.notna(ce_last):
+            ce_stop = float(ce_last)
+            if pd.notna(ce_atr) and ce_atr > 0:
+                ce_dist_atr = (ce_price - ce_stop) / float(ce_atr)
     # ---- 10-day EMA proximity (for SIP entry sizing) ----
     ema10 = ema10_dist = None
     d1 = frames.get("1d")
@@ -791,6 +809,10 @@ def score_holding_cached(ticker: str, market: str, timeframes: tuple):
         "st_dist_atr": st_cur.get("dist_atr"),
         "st_reversal_1w": st_cur.get("score_1w"),
         "st_anchor": st_cur.get("anchor"),
+        # ---- Chandelier Exit fields (22-bar highest-high, 3x ATR) ----
+        "ce_stop": ce_stop,
+        "ce_dist_atr": ce_dist_atr,
+        "ce_anchor": ce_anchor,
         # ---- 10-day EMA (SIP entry proximity) ----
         "ema10": ema10,
         "ema10_dist_pct": ema10_dist,
@@ -1403,6 +1425,7 @@ with tab_swp:
                         "trimmed for names you already bought this bar.")
 
             swp_rows = []
+            ce_rows = []
             sip_candidates = []
             # Bearish holdings whose reversal-to-Bull score is at/above this get a
             # small "reversal starter" SIP ahead of a likely bear→bull flip.
@@ -1421,6 +1444,13 @@ with tab_swp:
                             "Market": p["market"], "Qty": p["qty"],
                             "Trend": "❔", "Reversal Score": None,
                             "SWP action": "❔ No data", "SWP %": 0,
+                            "Shares to sell": None, f"Value freed {sym}": None,
+                        })
+                        ce_rows.append({
+                            "_amt": -1.0, "_color": "",
+                            "Ticker": tradingview_url(p["yf"]), "Symbol": p["symbol"],
+                            "Market": p["market"], "Qty": p["qty"],
+                            "CE action": "❔ No data", "SWP %": 0,
                             "Shares to sell": None, f"Value freed {sym}": None,
                         })
                         continue
@@ -1544,6 +1574,59 @@ with tab_swp:
                         "History note": hist_note or None,
                     })
 
+                    # ---- Chandelier Exit SWP (independent trailing-stop read) ----
+                    # A completed close below the 22-bar / 3x ATR long stop is the
+                    # exit trigger. Being within one ATR is only a warning, not a sale.
+                    ce_stop = sc.get("ce_stop")
+                    ce_dist_atr = sc.get("ce_dist_atr")
+                    if ce_stop is None or price is None:
+                        ce_swp = {"pct": 0, "label": "❔ No Chandelier data"}
+                    elif price < ce_stop:
+                        ce_swp = {"pct": 30, "label": "🔴 Strong SWP — CE stop breached"}
+                    elif ce_dist_atr is not None and ce_dist_atr <= 1:
+                        ce_swp = {"pct": 0, "label": "🟡 Watch — within 1 ATR of CE stop"}
+                    else:
+                        ce_swp = {"pct": 0, "label": "🟢 Hold — CE stop intact"}
+
+                    ce_act = {
+                        "side": "trim" if ce_swp["pct"] > 0 else "hold",
+                        "label": ce_swp["label"], "pct": ce_swp["pct"],
+                        "act_price": price, "day_target": None,
+                    }
+                    ce_act, ce_hist_note = apply_order_history(
+                        ce_act, hist, selected_tf, qty)
+                    ce_final_pct = ce_act["pct"] if ce_act["side"] != "hold" else 0
+                    ce_label = ce_act["label"] if ce_act["side"] != "hold" else ce_swp["label"]
+                    if ce_act["side"] == "hold" and ce_swp["pct"] > 0:
+                        ce_label = ce_act["label"]
+                    ce_shares = int(round(qty * ce_final_pct / 100)) if qty else None
+                    ce_value = (round(ce_shares * price, 2)
+                                if (ce_shares and price) else None)
+                    ce_color = "#7f1d1d" if ce_final_pct else (
+                        "#b45309" if "Watch" in ce_label else "")
+                    ce_dist_pct = (round((price / ce_stop - 1) * 100, 1)
+                                   if (price and ce_stop) else None)
+                    ce_rows.append({
+                        "_amt": float(ce_value) if ce_value else 0.0,
+                        "_color": ce_color,
+                        "Ticker": tradingview_url(p["yf"]),
+                        "Symbol": p["symbol"],
+                        "Market": p["market"],
+                        "Qty": qty,
+                        "Held days": held_days,
+                        "Gain %": p.get("gain_pct"),
+                        "CE action": ce_label,
+                        "SWP %": ce_final_pct,
+                        "Shares to sell": ce_shares,
+                        f"Value freed {sym}": ce_value,
+                        "Price": price,
+                        "CE long stop": ce_stop,
+                        "Distance to CE %": ce_dist_pct,
+                        "Distance to CE (ATR)": ce_dist_atr,
+                        "CE anchor": sc.get("ce_anchor"),
+                        "History note": ce_hist_note or None,
+                    })
+
             if not swp_rows:
                 st.info("No holdings could be scored yet.")
             else:
@@ -1619,6 +1702,78 @@ with tab_swp:
                     "cancels a tranche you've already sold this bar. Educational "
                     "info, not investment advice."
                 )
+
+                # ============== Chandelier Exit SWP (independent) ===============
+                st.divider()
+                st.markdown("#### 🕯️ Chandelier Exit SWP — independent trailing-stop plan")
+                st.caption(
+                    "Uses the **selected timeframe's anchor** (largest timeframe) with "
+                    "a standard **22-bar highest high − 3×ATR(22)** long stop. This is "
+                    "an independent profit-protection read: a completed close below the "
+                    "stop triggers a 30% SWP; being within 1 ATR is a warning only."
+                )
+                ce_total = sum(r["_amt"] for r in ce_rows if r["_amt"] > 0)
+                ce_n_exit = sum(1 for r in ce_rows if r["SWP %"] > 0)
+                if ce_n_exit:
+                    ce_top = " · ".join(
+                        f"**{r['Symbol']}** {r['CE action']} "
+                        f"({CCY_SYM.get(r['Market'], '')}{r['_amt']:,.0f})"
+                        for r in sorted(ce_rows, key=lambda x: x["_amt"], reverse=True)[:6]
+                        if r["_amt"] > 0)
+                    st.error(
+                        f"🔻 **Chandelier SWP now — withdraw ~{hsym}{ce_total:,.0f} "
+                        f"across {ce_n_exit} holding(s):** {ce_top}")
+                else:
+                    st.success("✅ No Chandelier stop breaches right now — hold, while "
+                               "monitoring any yellow watch rows.")
+
+                ce_df = (pd.DataFrame(ce_rows)
+                         .sort_values(["_amt", "Distance to CE %"],
+                                      ascending=[False, True])
+                         .reset_index(drop=True))
+
+                def _ce_row_color(row):
+                    c = row["_color"]
+                    style = (f"background-color: {c}; color: #ffffff; font-weight: 600"
+                             if c else "")
+                    return [style] * len(row)
+
+                st.dataframe(
+                    ce_df.style.apply(_ce_row_color, axis=1),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "_amt": None, "_color": None,
+                        "Ticker": st.column_config.LinkColumn(
+                            "Ticker", display_text=r"symbol=(.+)$"),
+                        "Gain %": st.column_config.NumberColumn("Gain %", format="%.1f%%"),
+                        "SWP %": st.column_config.NumberColumn(
+                            "SWP %", help="30% only after a completed close below the "
+                            "Chandelier long stop.", format="%d%%"),
+                        "CE long stop": st.column_config.NumberColumn(
+                            "CE long stop", help="Highest high over 22 anchor bars minus "
+                            "3×ATR(22). A completed close below this level breaches the "
+                            "long trailing stop.", format="%.2f"),
+                        "Distance to CE %": st.column_config.NumberColumn(
+                            "Distance to CE %", help="Price above/below the Chandelier "
+                            "long stop. Negative = breached.", format="%.1f%%"),
+                        "Distance to CE (ATR)": st.column_config.NumberColumn(
+                            "Distance to CE (ATR)", help="Price distance above/below the "
+                            "long stop in 22-period ATRs. ≤1 = warning zone.",
+                            format="%.2f"),
+                        "Price": st.column_config.NumberColumn("Price", format="%.2f"),
+                    },
+                )
+                st.download_button(
+                    "⬇️ Download Chandelier SWP plan",
+                    ce_df.drop(columns=["_amt", "_color"]).to_csv(index=False).encode(),
+                    file_name=f"chandelier_swp_{'-'.join(selected_tf)}.csv",
+                    mime="text/csv", key="ce_swp_dl")
+                st.caption(
+                    "**CE long stop** trails below the highest high of the last 22 "
+                    "anchor bars by 3×ATR(22). **Distance to CE %** below zero means "
+                    "the exit level has been breached. Order history nets down or "
+                    "cancels a tranche already sold this bar. Educational info, not "
+                    "investment advice.")
 
                 # ================= SIP deployment (entry side) =================
                 st.divider()
@@ -4685,4 +4840,3 @@ with tab_alerts:
         "Or schedule `python alert_watcher.py` (single check) via Windows Task "
         "Scheduler. Educational info, not investment advice."
     )
-
