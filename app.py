@@ -1637,28 +1637,36 @@ with tab_swp:
                         "History note": ce_hist_note or None,
                     })
 
-                    # ---- T1 / T2 profit-taking plan ----
+                    # ---- T1 / T2 / CE staged exit plan ----
                     # T1 is the app's first resistance / partial scale-out target;
-                    # T2 is its full measured-move runner target. Both are computed
-                    # by score_holding_cached using the sidebar-selected timeframe.
+                    # T2 is the measured-move runner target; CE protects the final
+                    # tranche using the selected stack's Chandelier long stop.
                     t1 = sc.get("target1")
                     t2 = sc.get("target")
-                    t1_pct = sc.get("scale_out_pct") or 40
-                    t2_pct = max(0, 100 - t1_pct)
+                    ce_target = sc.get("ce_stop")
+                    t1_pct, t2_pct, ce_pct = 40, 30, 30
                     avg_buy = ((hist or {}).get("avg_buy") or p.get("avg"))
-                    # Partition whole shares once so rounding the two tranches can
+                    # Partition whole shares once so rounding staged tranches can
                     # never recommend more shares than the uploaded position.
                     t1_shares = min(int(round(qty * t1_pct / 100)), int(qty))
-                    t2_shares = max(0, int(qty) - t1_shares)
-                    for target_name, target_price, planned_pct, max_stage_shares in (
-                        ("T1 · scale-out", t1, t1_pct, t1_shares),
-                        ("T2 · runner", t2, t2_pct, t2_shares),
+                    t2_shares = min(int(round(qty * t2_pct / 100)),
+                                    max(0, int(qty) - t1_shares))
+                    ce_shares = max(0, int(qty) - t1_shares - t2_shares)
+                    for (target_name, target_price, planned_pct, max_stage_shares,
+                         is_stop, stage_tf) in (
+                        ("T1 · scale-out", t1, t1_pct, t1_shares, False, target_tf),
+                        ("T2 · runner", t2, t2_pct, t2_shares, False, target_tf),
+                        ("CE · stop-loss exit", ce_target, ce_pct, ce_shares, True,
+                         sc.get("ce_anchor") or target_tf),
                     ):
                         if target_price is None or price is None:
                             continue
+                        planned_label = (
+                            "🛡️ Monitor CE stop"
+                            if is_stop else f"📌 Limit sell at {target_name}")
                         target_act = {
                             "side": "trim", "pct": planned_pct,
-                            "label": f"📌 Limit sell at {target_name}",
+                            "label": planned_label,
                             "act_price": target_price, "day_target": target_price,
                         }
                         target_act, target_hist_note = apply_order_history(
@@ -1671,9 +1679,10 @@ with tab_swp:
                             if qty else None)
                         expected = (round(target_shares * target_price, 2)
                                     if (target_shares and target_price) else None)
-                        reached = price >= target_price
+                        reached = price <= target_price if is_stop else price >= target_price
                         target_label = (
-                            f"🔴 Sell now — {target_name} reached"
+                            (f"🔴 Sell now — {target_name} breached"
+                             if is_stop else f"🔴 Sell now — {target_name} reached")
                             if reached else target_act["label"])
                         if target_act["side"] == "hold" and planned_pct > 0:
                             target_label = target_act["label"]
@@ -1693,7 +1702,7 @@ with tab_swp:
                             "Avg buy": avg_buy,
                             "Current price": price,
                             "Target": target_name,
-                            "Target timeframe": target_tf,
+                            "Target timeframe": stage_tf,
                             "Target price": target_price,
                             "Upside to target %": upside,
                             "Gain at target %": gain_at_target,
@@ -1781,14 +1790,15 @@ with tab_swp:
                     "info, not investment advice."
                 )
 
-                # ================= T1 / T2 profit-taking plan ==================
+                # =============== T1 / T2 / CE staged-exit plan ================
                 st.divider()
                 st.markdown("#### 🎯 Profit targets — T1/T2 scale-out plan")
                 st.caption(
                     f"Targets use the sidebar-selected stack (**{' + '.join(selected_tf)}**) "
-                    f"and its primary target timeframe (**{target_tf}**). **T1** is the "
-                    "first resistance / partial scale-out level; **T2** is the measured-"
-                    "move runner target. A red row means its target is already reached."
+                    f"and its primary target timeframe (**{target_tf}**). **T1 sells 40%** "
+                    "at first resistance, **T2 sells 30%** at the measured-move target, "
+                    "and the final **30%** is sold only after a completed close breaches "
+                    "the Chandelier long stop. A red row means its sale condition is met."
                 )
                 if not target_rows:
                     st.info("No profit-target data is available for the uploaded holdings.")
@@ -1806,8 +1816,8 @@ with tab_swp:
                             f"their sell level:** planned proceeds ~{hsym}{proceeds:,.0f}.")
                     else:
                         st.success(
-                            "✅ No target tranche is due now — use the listed levels as "
-                            "limit-sale plans rather than selling early.")
+                            "✅ No staged-exit tranche is due now — use T1/T2 as limit-sale "
+                            "plans and monitor the CE stop for the final tranche.")
 
                     def _target_row_color(row):
                         c = row["_color"]
@@ -1839,18 +1849,18 @@ with tab_swp:
                         },
                     )
                     st.download_button(
-                        "⬇️ Download T1/T2 target plan",
+                        "⬇️ Download T1/T2/CE exit plan",
                         target_df.drop(columns=["_target", "_color"]).to_csv(
                             index=False).encode(),
                         file_name=f"profit_targets_{'-'.join(selected_tf)}.csv",
                         mime="text/csv", key="profit_targets_dl")
                     st.caption(
-                        "**T1 sell %** is the model's normal first trim (typically 40%); "
-                        "**T2 sell %** is the remaining runner allocation. The uploaded "
-                        "transaction history reduces or suppresses a target tranche "
-                        "already sold during the current target bar. Confirm prices, "
-                        "share quantities, taxes, and order type before placing trades. "
-                        "Educational info, not investment advice.")
+                        "**T1** sells 40%, **T2** sells 30%, and the final **CE stop-loss "
+                        "exit** sells 30% only after price breaches the displayed "
+                        "Chandelier long stop. The uploaded transaction history reduces "
+                        "or suppresses a tranche already sold during the current target "
+                        "bar. Confirm prices, share quantities, taxes, and order type "
+                        "before placing trades. Educational info, not investment advice.")
 
                 # ============== Chandelier Exit SWP (independent) ===============
                 st.divider()
