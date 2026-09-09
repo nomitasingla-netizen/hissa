@@ -1426,7 +1426,10 @@ with tab_swp:
 
             swp_rows = []
             ce_rows = []
+            target_rows = []
             sip_candidates = []
+            target_tf = next((tf for tf in PRIMARY_ORDER if tf in selected_tf),
+                             _primary_tf(selected_tf))
             # Bearish holdings whose reversal-to-Bull score is at/above this get a
             # small "reversal starter" SIP ahead of a likely bear→bull flip.
             ST_REV_SIP_MIN = 90
@@ -1452,6 +1455,13 @@ with tab_swp:
                             "Market": p["market"], "Qty": p["qty"],
                             "CE action": "❔ No data", "SWP %": 0,
                             "Shares to sell": None, f"Value freed {sym}": None,
+                        })
+                        target_rows.append({
+                            "_target": float("inf"), "_color": "",
+                            "Ticker": tradingview_url(p["yf"]), "Symbol": p["symbol"],
+                            "Market": p["market"], "Target": "—",
+                            "Target action": "❔ No target data",
+                            "Shares to sell": None, "Target price": None,
                         })
                         continue
                     trend = sc.get("st_trend")
@@ -1627,6 +1637,74 @@ with tab_swp:
                         "History note": ce_hist_note or None,
                     })
 
+                    # ---- T1 / T2 profit-taking plan ----
+                    # T1 is the app's first resistance / partial scale-out target;
+                    # T2 is its full measured-move runner target. Both are computed
+                    # by score_holding_cached using the sidebar-selected timeframe.
+                    t1 = sc.get("target1")
+                    t2 = sc.get("target")
+                    t1_pct = sc.get("scale_out_pct") or 40
+                    t2_pct = max(0, 100 - t1_pct)
+                    avg_buy = ((hist or {}).get("avg_buy") or p.get("avg"))
+                    # Partition whole shares once so rounding the two tranches can
+                    # never recommend more shares than the uploaded position.
+                    t1_shares = min(int(round(qty * t1_pct / 100)), int(qty))
+                    t2_shares = max(0, int(qty) - t1_shares)
+                    for target_name, target_price, planned_pct, max_stage_shares in (
+                        ("T1 · scale-out", t1, t1_pct, t1_shares),
+                        ("T2 · runner", t2, t2_pct, t2_shares),
+                    ):
+                        if target_price is None or price is None:
+                            continue
+                        target_act = {
+                            "side": "trim", "pct": planned_pct,
+                            "label": f"📌 Limit sell at {target_name}",
+                            "act_price": target_price, "day_target": target_price,
+                        }
+                        target_act, target_hist_note = apply_order_history(
+                            target_act, hist, selected_tf, qty)
+                        target_pct = (target_act["pct"]
+                                      if target_act["side"] != "hold" else 0)
+                        target_shares = (min(
+                            max_stage_shares,
+                            int(round(qty * target_pct / 100)))
+                            if qty else None)
+                        expected = (round(target_shares * target_price, 2)
+                                    if (target_shares and target_price) else None)
+                        reached = price >= target_price
+                        target_label = (
+                            f"🔴 Sell now — {target_name} reached"
+                            if reached else target_act["label"])
+                        if target_act["side"] == "hold" and planned_pct > 0:
+                            target_label = target_act["label"]
+                        upside = (round((target_price / price - 1) * 100, 1)
+                                  if price else None)
+                        gain_at_target = (
+                            round((target_price / avg_buy - 1) * 100, 1)
+                            if avg_buy else None)
+                        target_rows.append({
+                            "_target": float(target_price),
+                            "_color": "#b91c1c" if reached and target_pct else "",
+                            "Ticker": tradingview_url(p["yf"]),
+                            "Symbol": p["symbol"],
+                            "Market": p["market"],
+                            "Qty": qty,
+                            "Held days": held_days,
+                            "Avg buy": avg_buy,
+                            "Current price": price,
+                            "Target": target_name,
+                            "Target timeframe": target_tf,
+                            "Target price": target_price,
+                            "Upside to target %": upside,
+                            "Gain at target %": gain_at_target,
+                            "Target action": target_label,
+                            "Sell %": target_pct,
+                            "Shares to sell": target_shares,
+                            "Currency": sym,
+                            "Expected proceeds": expected,
+                            "History note": target_hist_note or None,
+                        })
+
             if not swp_rows:
                 st.info("No holdings could be scored yet.")
             else:
@@ -1702,6 +1780,77 @@ with tab_swp:
                     "cancels a tranche you've already sold this bar. Educational "
                     "info, not investment advice."
                 )
+
+                # ================= T1 / T2 profit-taking plan ==================
+                st.divider()
+                st.markdown("#### 🎯 Profit targets — T1/T2 scale-out plan")
+                st.caption(
+                    f"Targets use the sidebar-selected stack (**{' + '.join(selected_tf)}**) "
+                    f"and its primary target timeframe (**{target_tf}**). **T1** is the "
+                    "first resistance / partial scale-out level; **T2** is the measured-"
+                    "move runner target. A red row means its target is already reached."
+                )
+                if not target_rows:
+                    st.info("No profit-target data is available for the uploaded holdings.")
+                else:
+                    target_df = (pd.DataFrame(target_rows)
+                                 .sort_values(["_target", "Symbol", "Target"],
+                                              ascending=[True, True, True])
+                                 .reset_index(drop=True))
+                    target_ready = target_df[
+                        target_df["Target action"].str.startswith("🔴", na=False)]
+                    if not target_ready.empty:
+                        proceeds = target_ready["Expected proceeds"].fillna(0).sum()
+                        st.warning(
+                            f"🎯 **{len(target_ready)} target tranche(s) are at or above "
+                            f"their sell level:** planned proceeds ~{hsym}{proceeds:,.0f}.")
+                    else:
+                        st.success(
+                            "✅ No target tranche is due now — use the listed levels as "
+                            "limit-sale plans rather than selling early.")
+
+                    def _target_row_color(row):
+                        c = row["_color"]
+                        style = (f"background-color: {c}; color: #ffffff; font-weight: 600"
+                                 if c else "")
+                        return [style] * len(row)
+
+                    st.dataframe(
+                        target_df.style.apply(_target_row_color, axis=1),
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            "_target": None, "_color": None,
+                            "Ticker": st.column_config.LinkColumn(
+                                "Ticker", display_text=r"symbol=(.+)$"),
+                            "Avg buy": st.column_config.NumberColumn(
+                                "Avg buy", format="%.2f"),
+                            "Current price": st.column_config.NumberColumn(
+                                "Current price", format="%.2f"),
+                            "Target price": st.column_config.NumberColumn(
+                                "Target price", format="%.2f"),
+                            "Upside to target %": st.column_config.NumberColumn(
+                                "Upside to target %", format="%.1f%%"),
+                            "Gain at target %": st.column_config.NumberColumn(
+                                "Gain at target %", format="%.1f%%"),
+                            "Sell %": st.column_config.NumberColumn(
+                                "Sell %", format="%d%%"),
+                            "Expected proceeds": st.column_config.NumberColumn(
+                                "Expected proceeds", format="%.2f"),
+                        },
+                    )
+                    st.download_button(
+                        "⬇️ Download T1/T2 target plan",
+                        target_df.drop(columns=["_target", "_color"]).to_csv(
+                            index=False).encode(),
+                        file_name=f"profit_targets_{'-'.join(selected_tf)}.csv",
+                        mime="text/csv", key="profit_targets_dl")
+                    st.caption(
+                        "**T1 sell %** is the model's normal first trim (typically 40%); "
+                        "**T2 sell %** is the remaining runner allocation. The uploaded "
+                        "transaction history reduces or suppresses a target tranche "
+                        "already sold during the current target bar. Confirm prices, "
+                        "share quantities, taxes, and order type before placing trades. "
+                        "Educational info, not investment advice.")
 
                 # ============== Chandelier Exit SWP (independent) ===============
                 st.divider()
@@ -2567,6 +2716,7 @@ def render_stock_screen(default_path, folder_glob, key_prefix, heading, blurb):
                     "Score 2w ago": data.get("score_2w"),
                     "Stack": data.get("stack"),
                     "Dist-to-flip (ATR)": round(da, 2) if da is not None else None,
+                    "Flip price": data.get("flip_price"),
                 })
             else:
                 fails += 1
@@ -2613,6 +2763,9 @@ def render_stock_screen(default_path, folder_glob, key_prefix, heading, blurb):
             "Dist-to-flip (ATR)", help="How far the anchor price is from its "
             "Supertrend flip line, in ATRs. Smaller = riper for a flip.",
             format="%.2f"),
+        "Flip price": st.column_config.NumberColumn(
+            "Flip price", help="Exact anchor Supertrend line. A completed close "
+            "across this price flips the anchor trend.", format="%.2f"),
     }
 
     def _color_rows(row):
@@ -2760,6 +2913,7 @@ with tab_ipo_ath:
                     "Score 2w ago": data.get("score_2w"),
                     "Stack": data.get("stack"),
                     "Dist-to-flip (ATR)": round(da, 2) if da is not None else None,
+                    "Flip price": data.get("flip_price"),
                 })
             prog.empty()
             st.session_state["ipoath_rows"] = rows
@@ -2814,6 +2968,9 @@ with tab_ipo_ath:
                 "Dist-to-flip (ATR)", help="Distance of the anchor price from its "
                 "Supertrend flip line, in ATRs. Smaller = riper for a flip.",
                 format="%.2f"),
+            "Flip price": st.column_config.NumberColumn(
+                "Flip price", help="Exact anchor Supertrend line. A completed close "
+                "across this price flips the anchor trend.", format="%.2f"),
         }
 
         def _ath_color_rows(row):
@@ -2976,6 +3133,9 @@ with tab_st:
             "Dist-to-flip (ATR)", help="How far the anchor's price is from its "
             "Supertrend flip line, in ATRs. Smaller = riper for a flip",
             format="%.2f"),
+        "Flip price": st.column_config.NumberColumn(
+            "Flip price", help="Exact anchor Supertrend line. A completed close "
+            "across this price flips the anchor trend.", format="%.2f"),
     }
 
     def _render_st_group(group_rows, title, caption, ascending, mkt, suffix):
@@ -3041,6 +3201,7 @@ with tab_st:
                 "Reversal to": data.get("reversal_to"),
                 "Stack": data.get("stack"),
                 "Dist-to-flip (ATR)": round(da, 2) if da is not None else None,
+                "Flip price": data.get("flip_price"),
             })
             if score is not None and score >= 60 and "Bull" in (data.get("trend") or ""):
                 ripe.append((s, data))
