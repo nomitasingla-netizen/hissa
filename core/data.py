@@ -98,6 +98,18 @@ def fetch_ohlcv(ticker: str) -> dict[str, pd.DataFrame]:
     return result
 
 
+def fetch_daily_ohlcv(ticker: str) -> pd.DataFrame:
+    """Fetch daily OHLCV only for lightweight universe-level screens."""
+    try:
+        daily = yf.download(
+            ticker, period=_DAILY_PERIOD, interval="1d",
+            auto_adjust=True, progress=False, threads=False,
+        )
+        return _drop_incomplete(_flatten(daily))
+    except Exception:
+        return pd.DataFrame()
+
+
 def get_fund_info(ticker: str) -> dict:
     """Return fund 'wealth' metrics: AUM (net/total assets) and currency.
 
@@ -140,4 +152,3 @@ def truncate_frames(frames: dict, as_of) -> dict:
             naive = idx
         out[key] = df[naive <= cutoff]
     return out
-

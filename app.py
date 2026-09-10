@@ -11,7 +11,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from core.data import fetch_ohlcv, truncate_frames, get_fund_info
+from core.data import fetch_daily_ohlcv, fetch_ohlcv, truncate_frames, get_fund_info
 import core.etfs as etfs
 import core.indicators as ind
 import core.stocks as stocks
@@ -84,6 +84,78 @@ def cached_ohlcv(ticker: str) -> dict:
 
 def load_frames(ticker: str) -> dict:
     return cached_ohlcv(ticker)
+
+
+ETF_BUY_DATA_PATHS = {
+    "India": Path(__file__).parent / "config" / "etf_data.csv",
+    "US": Path(__file__).parent / "config" / "us_etf_data.csv",
+}
+
+
+def _nse_etf_symbol(value) -> str:
+    """Normalize config/broker NSE ETF symbols to their Yahoo Finance ticker."""
+    symbol = str(value or "").strip().upper().replace("\\", "")
+    if symbol.startswith("NSE:"):
+        symbol = symbol[4:]
+    return symbol if symbol.endswith(".NS") else f"{symbol}.NS"
+
+
+def _etf_trade_symbol(value, market: str) -> str:
+    """Normalize an ETF symbol from the configured market for market data."""
+    if market == "India":
+        return _nse_etf_symbol(value)
+    return str(value or "").strip().upper()
+
+
+@st.cache_data(show_spinner=False)
+def load_etf_buy_universe(market: str) -> list[dict]:
+    """Load the explicitly configured ETF universe and its categories."""
+    data_path = ETF_BUY_DATA_PATHS.get(market)
+    if data_path is None:
+        return []
+    try:
+        frame = pd.read_csv(data_path)
+    except (OSError, pd.errors.ParserError):
+        return []
+    columns = {str(c).strip().lower(): c for c in frame.columns}
+    if "symbol" not in columns or "category" not in columns:
+        return []
+    rows = []
+    for _, row in frame.iterrows():
+        yf = _etf_trade_symbol(row[columns["symbol"]], market)
+        if not yf or yf == ".NS":
+            continue
+        rows.append({
+            "symbol": yf[:-3] if market == "India" else yf,
+            "yf": yf,
+            "category": str(row[columns["category"]]).strip() or "Uncategorized",
+        })
+    return rows
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def etf_buy_stats_cached(ticker: str) -> dict | None:
+    """Return one-day, 30-calendar-day, and daily-volume ETF screen inputs."""
+    daily = fetch_daily_ohlcv(ticker)
+    if daily.empty or len(daily) < 22 or not {"Close", "Volume"}.issubset(daily.columns):
+        return None
+    close = daily["Close"].astype(float).dropna()
+    if len(close) < 2:
+        return None
+    as_of = pd.Timestamp(close.index[-1])
+    old = close.loc[close.index <= as_of - pd.Timedelta(days=30)]
+    if old.empty:
+        return None
+    price = float(close.iloc[-1])
+    previous = float(close.iloc[-2])
+    month_start = float(old.iloc[-1])
+    return {
+        "price": price,
+        "daily_change": round((price / previous - 1) * 100, 2),
+        "monthly_change": round((price / month_start - 1) * 100, 2),
+        "volume": float(daily["Volume"].iloc[-1]),
+        "as_of": as_of.strftime("%Y-%m-%d"),
+    }
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -840,6 +912,34 @@ MARKET_HOURS = {
 ACTION_WINDOW_MIN = 30  # act within this many minutes of a bar close
 
 
+def market_last_15_window_status(market: str) -> tuple[str, bool]:
+    """Return whether the selected market's final 15-minute window is open."""
+    spec = MARKET_HOURS.get(market)
+    if not spec:
+        return f"{market} close window: schedule unavailable", False
+    try:
+        from datetime import datetime, time
+        from zoneinfo import ZoneInfo
+        tzname, (_, _), (close_hour, close_minute) = spec
+        now = datetime.now(ZoneInfo(tzname))
+    except Exception:
+        return f"{market} close window: timezone unavailable", False
+    if now.weekday() >= 5:
+        return f"{market} close window: market closed (weekend)", False
+    close = time(close_hour, close_minute)
+    start_dt = now.replace(hour=close_hour, minute=close_minute, second=0,
+                           microsecond=0) - pd.Timedelta(minutes=15)
+    start = start_dt.time()
+    now_time = now.timetz().replace(tzinfo=None)
+    if now_time < start:
+        return (f"{market} close window opens at {start.strftime('%I:%M %p')} "
+                f"({now.strftime('%I:%M %p')} now)", False)
+    if now_time > close:
+        return f"{market} close window closed at {close.strftime('%I:%M %p')}", False
+    return (f"{market} close window is open until {close.strftime('%I:%M %p')} "
+            f"({now.strftime('%I:%M %p')} now)", True)
+
+
 def _primary_tf(timeframes) -> str:
     """The highest (longest) timeframe drives the action cadence."""
     for tf in ("1wk", "1d", "4h"):
@@ -1274,8 +1374,9 @@ def _days_held(hist) -> int:
 
 
 SHOW_SIP_TAB = False  # SIP & Exit Plan tab hidden; flip to True to restore it
-tab_swp, tab_st, tab_dump, tab_watch, tab_ipo_ath, tab_exit, tab_trigger, tab1, tab2, tab3, tab_rate, tab_life, tab_flows, tab4, tab5, tab6, tab7, tab_alerts = st.tabs(
+tab_swp, tab_st, tab_etf_trade, tab_dump, tab_watch, tab_ipo_ath, tab_exit, tab_trigger, tab1, tab2, tab3, tab_rate, tab_life, tab_flows, tab4, tab5, tab6, tab7, tab_alerts = st.tabs(
     ["🏧 SWP Exit — Supertrend", "🔀 Supertrend Reversal",
+     "🛒 ETF Buying & Selling Instructions",
      "📥 Dump Screen — Supertrend", "⭐ Watchlist — Supertrend",
      "🏆 IPO near ATH — Supertrend",
      "🎯 Exit plan — your holdings", "⚡ Breakout Trigger",
@@ -3019,6 +3120,276 @@ with tab_ipo_ath:
             "ATH = highest daily high in the available history (recent IPOs, so this "
             "is effectively the post-listing peak). Very new IPOs without yfinance "
             "history are skipped. Educational info, not investment advice.")
+
+
+# --- ETF buying & selling instructions: standalone from sector scan ---
+with tab_etf_trade:
+    st.subheader("🛒 ETF Buying & Selling Instructions")
+    etf_market = st.selectbox(
+        "Market", ["India", "US"], key="etf_trade_market",
+        help="Selects the ETF universe, market timezone, currency, and close window.")
+    etf_data_path = ETF_BUY_DATA_PATHS[etf_market]
+    etf_currency = CCY_SYM.get(etf_market, "$")
+    close_window_label = "3:15–3:30 PM IST" if etf_market == "India" else (
+        "3:45–4:00 PM ET")
+    st.caption(
+        f"{etf_market} ETF pullback plan from `{etf_data_path.name}`: buy at most one ETF "
+        f"during the final 15 minutes of regular trading (**{close_window_label}**) "
+        "when its one-day change is **≤−1%**, "
+        "its 30-calendar-day change is **>−2.5%**, and its latest daily volume is "
+        "above **500,000**. Eligible ETFs are ranked by the largest daily loss, then "
+        "the largest 30-day loss. The previous ETF buy's category is excluded."
+    )
+    buy_window_text, buy_window_open = market_last_15_window_status(etf_market)
+    if buy_window_open:
+        st.success(f"🟢 {buy_window_text}")
+    else:
+        st.warning(f"🕒 {buy_window_text} — no new purchase instruction will be issued.")
+
+    etf_universe = load_etf_buy_universe(etf_market)
+    if not etf_universe:
+        st.error(
+            f"Couldn't load a valid Symbol/Category ETF list from `{etf_data_path}`.")
+    else:
+        col_cash, col_pos, col_orders = st.columns([1, 1.25, 1.25])
+        with col_cash:
+            etf_cash = st.number_input(
+                f"Available cash ({etf_currency})", min_value=0.0, value=0.0, step=1000.0,
+                key="etf_trade_cash",
+                help="The selected buy receives exactly 10% of this cash balance.")
+        with col_pos:
+            etf_pos_upload = st.file_uploader(
+                "Positions CSV", type=["csv"], key="etf_trade_positions",
+                help="Optional broker holdings export. It is used for the ≥3% "
+                "target-return sell instructions below.")
+        with col_orders:
+            etf_order_uploads = st.file_uploader(
+                "Order history", type=["csv", "xlsx", "xls"],
+                accept_multiple_files=True, key="etf_trade_orders",
+                help="Required to enforce one ETF buy per day and avoid the category "
+                "of the most recently purchased ETF.")
+
+        order_rows = []
+        for order_file in etf_order_uploads or []:
+            orders, _ = parse_orders_bytes(order_file.getvalue(), order_file.name)
+            order_rows.extend(orders)
+        order_summary = summarize_orders(order_rows) if order_rows else {}
+        category_by_yf = {item["yf"]: item["category"] for item in etf_universe}
+        try:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            market_today = datetime.now(ZoneInfo(MARKET_HOURS[etf_market][0])).date()
+        except Exception:
+            market_today = pd.Timestamp.now().date()
+
+        etf_buys = [
+            order for order in order_rows
+            if order.get("market") == etf_market and order.get("side") == "buy"
+            and _etf_trade_symbol(order.get("symbol"), etf_market) in category_by_yf
+            and pd.notna(order.get("date"))
+        ]
+        etf_buys.sort(key=lambda order: pd.Timestamp(order["date"]), reverse=True)
+        last_etf_buy = etf_buys[0] if etf_buys else None
+        previous_category = (
+            category_by_yf.get(_etf_trade_symbol(last_etf_buy["symbol"], etf_market))
+            if last_etf_buy else None)
+        bought_today = any(
+            pd.Timestamp(order["date"]).date() == market_today for order in etf_buys)
+
+        if last_etf_buy:
+            st.info(
+                f"Last recorded ETF buy: **{last_etf_buy['symbol']}** "
+                f"({previous_category}) on **{pd.Timestamp(last_etf_buy['date']).date()}**. "
+                f"That category is excluded from the next purchase.")
+        else:
+            st.info(
+                "Upload order history to enforce the one-buy-per-day and "
+                "previous-category rules. Until then, no buy instruction is issued.")
+
+        run_etf_screen = st.button(
+            "▶️ Screen ETF pullbacks", type="primary", key="etf_trade_screen",
+            help=f"Fetch latest daily data only for ETFs in {etf_data_path.name}.")
+        if run_etf_screen:
+            rows, skipped = [], 0
+            progress = st.progress(0.0, text="Checking ETF daily change, 30-day change, and volume…")
+            for index, item in enumerate(etf_universe, start=1):
+                progress.progress(
+                    index / len(etf_universe),
+                    text=f"Checking {item['symbol']} ({index}/{len(etf_universe)})…")
+                stats = etf_buy_stats_cached(item["yf"])
+                if stats is None:
+                    skipped += 1
+                    continue
+                rows.append({
+                    "Ticker": tradingview_url(item["yf"]),
+                    "ETF": item["symbol"],
+                    "Category": item["category"],
+                    "1D change %": stats["daily_change"],
+                    "30D change %": stats["monthly_change"],
+                    "Daily volume": int(stats["volume"]),
+                    "Price": stats["price"],
+                    "As of": stats["as_of"],
+                })
+            progress.empty()
+            st.session_state["etf_trade_rows"] = rows
+            st.session_state["etf_trade_skipped"] = skipped
+            st.session_state["etf_trade_scan_market"] = etf_market
+
+        screen_rows = (
+            st.session_state.get("etf_trade_rows")
+            if st.session_state.get("etf_trade_scan_market") == etf_market else None)
+        if screen_rows is None:
+            st.info("👆 Click **Screen ETF pullbacks** to generate the ranked ETF list.")
+        else:
+            qualified = [
+                row for row in screen_rows
+                if row["1D change %"] <= -1
+                and row["30D change %"] > -2.5
+                and row["Daily volume"] > 500_000
+            ]
+            ranked = sorted(
+                qualified,
+                key=lambda row: (row["1D change %"], row["30D change %"], row["ETF"]),
+            )
+            available = [
+                row for row in ranked if row["Category"] != previous_category]
+
+            st.markdown("#### 📉 Ranked ETF pullbacks")
+            if not ranked:
+                st.info(
+                    "No ETF currently satisfies all purchase filters: 1D change ≤−1%, "
+                    "30D change >−2.5%, and daily volume >500,000.")
+            else:
+                # Keep the ranking deliberately compact: the strategy ranks only
+                # daily and monthly declines, while category rules control selection.
+                ranking_df = pd.DataFrame(ranked)[["Ticker", "1D change %", "30D change %"]]
+                st.dataframe(
+                    ranking_df, use_container_width=True, hide_index=True,
+                    column_config={
+                        "Ticker": st.column_config.LinkColumn(
+                            "Ticker", display_text=r"symbol=(.+)$"),
+                        "1D change %": st.column_config.NumberColumn(
+                            "1D change %", format="%.2f%%"),
+                        "30D change %": st.column_config.NumberColumn(
+                            "30D change %", format="%.2f%%"),
+                    },
+                )
+                st.caption(
+                    f"{len(ranked)} qualified ETF(s); "
+                    f"{st.session_state.get('etf_trade_skipped', 0)} skipped for insufficient data.")
+
+            pick = available[0] if available else None
+            if bought_today:
+                st.warning(
+                    "✋ **No buy today:** uploaded order history already records an ETF "
+                    "purchase today. This strategy permits only one ETF buy per day.")
+            elif not last_etf_buy:
+                st.warning(
+                    "✋ **Buy blocked:** upload order history before acting so the app can "
+                    "enforce one buy per day and category rotation.")
+            elif not pick:
+                if ranked:
+                    st.warning(
+                        f"✋ **No buy:** every qualified ETF is in the previously bought "
+                        f"**{previous_category}** category.")
+            elif not buy_window_open:
+                st.info(
+                    f"⏳ Top eligible ETF is **{pick['ETF']}** ({pick['Category']}); "
+                    "the purchase window is closed, so do not place the order yet.")
+            elif etf_cash <= 0:
+                st.info(
+                    f"Top eligible ETF is **{pick['ETF']}** ({pick['Category']}). "
+                    "Enter available cash to calculate the 10% allocation.")
+            else:
+                allocation = round(etf_cash * 0.10, 2)
+                shares = int(allocation // pick["Price"]) if pick["Price"] else 0
+                spend = round(shares * pick["Price"], 2)
+                st.success(
+                    f"🟢 **BUY {pick['ETF']} — {pick['Category']}:** allocate up to "
+                    f"{etf_currency}{allocation:,.2f} (10% of cash), approximately "
+                    f"**{shares} units** at {etf_currency}{pick['Price']:,.2f}; "
+                    f"estimated spend {etf_currency}{spend:,.2f}. "
+                    f"Today: {pick['1D change %']:.2f}% · 30D: {pick['30D change %']:.2f}%.")
+
+        st.divider()
+        sell_heading = (
+            "#### 💰 US sell instructions — final 15 minutes, ≥3% return"
+            if etf_market == "US" else
+            "#### 💰 Flexible sell instructions — ≥3% return")
+        st.markdown(sell_heading)
+        if etf_market == "US":
+            st.caption(
+                "US sales are issued only during the final 15 minutes of regular "
+                "trading. Positions from the uploaded CSV are matched to the configured "
+                "ETF list; a sell is shown only when the latest price is more than 3% "
+                "above your recorded average cost.")
+        else:
+            st.caption(
+                "India sales have no time-window restriction. Positions from the uploaded "
+                "CSV are matched to the configured ETF list; a sell is shown only when "
+                "the latest price is more than 3% above your recorded average cost.")
+        sell_rows = []
+        if etf_pos_upload is None:
+            st.info("Upload a positions CSV to see ETF positions eligible for the ≥3% sell rule.")
+        else:
+            positions, position_format = parse_positions_text(
+                etf_pos_upload.getvalue().decode("utf-8", errors="ignore"))
+            for position in positions:
+                if position.get("market") != etf_market:
+                    continue
+                yf = _etf_trade_symbol(position.get("symbol"), etf_market)
+                if yf not in category_by_yf:
+                    continue
+                stats = etf_buy_stats_cached(yf)
+                price = (stats or {}).get("price") or position.get("ltp")
+                order_symbol = yf[:-3] if etf_market == "India" else yf
+                hist = order_summary.get(f"{etf_market}:{order_symbol}")
+                avg_cost = (hist or {}).get("avg_buy") or position.get("avg")
+                if not price or not avg_cost:
+                    continue
+                return_pct = round((price / avg_cost - 1) * 100, 2)
+                if return_pct <= 3:
+                    continue
+                qty = position.get("qty") or 0
+                sell_rows.append({
+                    "Ticker": tradingview_url(yf),
+                    "ETF": yf[:-3],
+                    "Category": category_by_yf[yf],
+                    "Qty": qty,
+                    "Avg cost": avg_cost,
+                    "Latest price": price,
+                    "Return %": return_pct,
+                    "Sell instruction": (
+                        "🟢 SELL — return above 3%"
+                        if etf_market != "US" or buy_window_open
+                        else "🕒 SELL window closed — wait for final 15 min"),
+                    f"Estimated value {etf_currency}": round(qty * price, 2),
+                })
+            if not sell_rows:
+                st.info("No uploaded ETF position is currently above the 3% return threshold.")
+            else:
+                sell_df = (pd.DataFrame(sell_rows)
+                           .sort_values("Return %", ascending=False)
+                           .reset_index(drop=True))
+                st.dataframe(
+                    sell_df, use_container_width=True, hide_index=True,
+                    column_config={
+                        "Ticker": st.column_config.LinkColumn(
+                            "Ticker", display_text=r"symbol=(.+)$"),
+                        "Avg cost": st.column_config.NumberColumn("Avg cost", format="%.2f"),
+                        "Latest price": st.column_config.NumberColumn(
+                            "Latest price", format="%.2f"),
+                        "Return %": st.column_config.NumberColumn("Return %", format="%.2f%%"),
+                        f"Estimated value {etf_currency}": st.column_config.NumberColumn(
+                            f"Estimated value {etf_currency}", format="%.2f"),
+                    },
+                )
+
+    st.caption(
+        "The daily bar and volume can still be forming during the final 15 minutes. "
+        "US buys and sells are both gated to that window; India buys are gated while "
+        "India sell timing remains flexible. This tab produces instructions only; it "
+        "does not place broker orders. Educational information, not investment advice.")
 
 
 # --- Gate: scanner tabs need a scan; the tabs above do not ---
