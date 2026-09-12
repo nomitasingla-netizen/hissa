@@ -182,9 +182,10 @@ def supertrend_performance_cached(ticker: str) -> dict | None:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def bollinger_midpoint_30m_cached(ticker: str) -> dict | None:
-    """Return the latest 20-period Bollinger midpoint from 30-minute candles."""
-    candles = fetch_30m_ohlcv(ticker)
+def bollinger_midpoint_cached(ticker: str, timeframe: str) -> dict | None:
+    """Return the latest 20-period Bollinger midpoint for an entry timeframe."""
+    candles = (fetch_30m_ohlcv(ticker) if timeframe == "30m"
+               else load_frames(ticker).get(timeframe, pd.DataFrame()))
     if candles.empty or len(candles) < 20 or "Close" not in candles.columns:
         return None
     mid, _, _, _ = ind.bollinger(candles["Close"].astype(float), window=20)
@@ -317,6 +318,35 @@ TF_MAP = {
     "MTF 1h+2h+4h+1D+1W": ("1h", "2h", "4h", "1d", "1wk"),
 }
 selected_tf = TF_MAP[tf_choice]
+
+BOLLINGER_ENTRY_TFS = {
+    "30 minutes": "30m",
+    "1 hour": "1h",
+    "2 hours": "2h",
+    "4 hours": "4h",
+    "1 day": "1d",
+    "1 week": "1wk",
+}
+BOLLINGER_TF_LABELS = {value: label for label, value in BOLLINGER_ENTRY_TFS.items()}
+
+
+def bollinger_entry_timeframe_selector(key: str) -> tuple[str, str]:
+    """Select an entry timeframe, defaulting to the scanner MTF anchor."""
+    anchor_tf = selected_tf[-1]
+    anchor_label = f"Scanner MTF anchor ({BOLLINGER_TF_LABELS[anchor_tf]})"
+    choice = st.selectbox(
+        "Bollinger entry timeframe",
+        [anchor_label, *BOLLINGER_ENTRY_TFS],
+        key=key,
+        help="Uses a 20-period Bollinger middle band. The default follows the "
+        "largest timeframe selected in Scanner Settings; choose 30 minutes or "
+        "another listed timeframe to override it for this entry plan.",
+    )
+    return (
+        anchor_tf if choice == anchor_label else BOLLINGER_ENTRY_TFS[choice],
+        choice,
+    )
+
 
 # Which Supertrend-reversal combo (ST_COMBOS key) a selected timeframe maps to.
 # MTF stacks map 1:1; the classic blends fall back to a sensible default so the
@@ -556,7 +586,7 @@ if run:
     if not backtest:
         # A live refresh must rebuild score inputs from the newest quote/session data.
         cached_ohlcv.clear()
-        bollinger_midpoint_30m_cached.clear()
+        bollinger_midpoint_cached.clear()
     st.session_state["results"] = run_scan(selected_markets, custom_lists, selected_tf, as_of_date)
 
 results = st.session_state.get("results", [])
@@ -1609,21 +1639,31 @@ with tab_swp:
         else:
             st.caption(f"Detected **{swp_fmt.upper()}** format — {len(swp_positions)} holdings.")
 
-            # ---- Investable cash per market (for the SIP-entry side) ----
+            # ---- Portfolio sizing inputs per market (for the SIP-entry side) ----
             swp_markets = sorted({p["market"] for p in swp_positions})
             swp_cash = {}
-            _ccols = st.columns(max(len(swp_markets), 1))
+            swp_total_capital = {}
             for _i, _mk in enumerate(swp_markets):
-                with _ccols[_i]:
+                st.markdown(f"#### {_mk} SIP sizing")
+                capital_col, cash_col = st.columns(2)
+                with capital_col:
+                    swp_total_capital[_mk] = st.number_input(
+                        f"Total portfolio capital ({_mk}, {CCY_SYM.get(_mk, '')})",
+                        min_value=0.0, value=0.0, step=1000.0,
+                        key=f"swp_sip_total_capital_{_mk}",
+                        help="Each actionable SIP entry is sized at 4% of this total "
+                        "portfolio capital.")
+                with cash_col:
                     swp_cash[_mk] = st.number_input(
-                        f"💵 Investable cash to SIP ({_mk}, {CCY_SYM.get(_mk, '')})",
+                        f"💵 Cash in hand ({_mk}, {CCY_SYM.get(_mk, '')})",
                         min_value=0.0, value=0.0, step=1000.0,
                         key=f"swp_sip_cash_{_mk}",
-                        help="Cash to deploy into your BULLISH holdings that have a LOW "
-                        "reversal score. It is spread across sectors (diversified), "
-                        "tilted toward names trading near/below their 10-day EMA, and "
-                        "trimmed for names you already bought this bar.")
+                        help="Cash available for SIP entries. The plan marks an entry "
+                        "actionable only when remaining cash covers its full 4% "
+                        "allocation.")
 
+            swp_bb_timeframe, swp_bb_label = bollinger_entry_timeframe_selector(
+                "swp_bollinger_entry_timeframe")
             swp_rows = []
             ce_rows = []
             target_rows = []
@@ -1922,20 +1962,6 @@ with tab_swp:
                 hsym = CCY_SYM.get(max(set(mkts), key=mkts.count), "")
                 total = sum(r["_amt"] for r in swp_rows if r["_amt"] > 0)
                 n_exit = sum(1 for r in swp_rows if r["SWP %"] > 0)
-                if n_exit:
-                    top_bits = " · ".join(
-                        f"**{r['Symbol']}** {r['SWP action']} "
-                        f"({CCY_SYM.get(r['Market'],'')}{r['_amt']:,.0f})"
-                        for r in sorted(swp_rows, key=lambda x: x["_amt"], reverse=True)[:6]
-                        if r["_amt"] > 0)
-                    st.error(
-                        f"🔻 **SWP now — withdraw ~{hsym}{total:,.0f} across "
-                        f"{n_exit} holding(s):** {top_bits}")
-                else:
-                    st.success(
-                        "✅ No SWP exits right now — no holding is in a locked "
-                        "downtrend or topping on this stack.")
-
                 swp_df = (pd.DataFrame(swp_rows)
                           .sort_values(["_amt", "Reversal Score"],
                                        ascending=[False, True])
@@ -1947,48 +1973,71 @@ with tab_swp:
                              if c else "")
                     return [style] * len(row)
 
-                styler = swp_df.style.apply(_swp_row_color, axis=1)
-                st.dataframe(
-                    styler, use_container_width=True, hide_index=True,
-                    column_config={
-                        "_amt": None, "_color": None,
-                        "Ticker": st.column_config.LinkColumn(
-                            "Ticker", display_text=r"symbol=(.+)$"),
-                        "Gain %": st.column_config.NumberColumn("Gain %", format="%.1f%%"),
-                        "Trend": st.column_config.TextColumn(
-                            "Trend", help="Current Supertrend direction of the anchor "
-                            "(largest) timeframe in the selected stack"),
-                        "Reversal Score": st.column_config.ProgressColumn(
-                            "Reversal Score", help="0–100. On the exit side a Bearish "
-                            "trend with a LOW score = downtrend locked (SWP hardest); "
-                            "a Bullish trend with a HIGH score = topping (start SWP)",
-                            min_value=0, max_value=100, format="%d"),
-                        "Score 1w ago": st.column_config.NumberColumn(
-                            "Score 1w ago", help="Reversal score ~1 week ago", format="%d"),
-                        "SWP %": st.column_config.NumberColumn(
-                            "SWP %", help="% of this holding to withdraw now", format="%d%%"),
-                        "ST flip/stop": st.column_config.NumberColumn(
-                            "ST flip/stop", help="Anchor Supertrend line — the level "
-                            "price must reclaim to flip bullish (a close back above it "
-                            "stops the SWP)", format="%.2f"),
-                        "Price": st.column_config.NumberColumn("Price", format="%.2f"),
-                    },
-                )
-                st.download_button(
-                    "⬇️ Download SWP exit plan",
-                    swp_df.drop(columns=["_amt", "_color"]).to_csv(index=False).encode(),
-                    file_name=f"swp_exit_{'-'.join(selected_tf)}.csv", mime="text/csv",
-                    key="swp_dl")
-                st.caption(
-                    "**SWP %** scales with how *locked* the reversal is: a Bearish "
-                    "holding withdraws 30/20/10% as the score sits below 20/40/55, then "
-                    "Holds once ≥55 (a bull flip is building). A Bullish holding starts "
-                    "a 6/12/20% SWP as the score climbs through 55/65/80 (a top "
-                    "building). **Shares to sell** = SWP % × quantity; rows are ordered "
-                    "by **Value freed**, largest exit first. Order history nets down or "
-                    "cancels a tranche you've already sold this bar. Educational "
-                    "info, not investment advice."
-                )
+                def _render_swp_reversal_table():
+                    """Render the score-driven SWP plan after other exit tables."""
+                    st.divider()
+                    st.markdown("#### 🔀 Supertrend reversal-score SWP plan")
+                    if n_exit:
+                        top_bits = " · ".join(
+                            f"**{r['Symbol']}** {r['SWP action']} "
+                            f"({CCY_SYM.get(r['Market'],'')}{r['_amt']:,.0f})"
+                            for r in sorted(
+                                swp_rows, key=lambda x: x["_amt"], reverse=True)[:6]
+                            if r["_amt"] > 0)
+                        st.error(
+                            f"🔻 **SWP now — withdraw ~{hsym}{total:,.0f} across "
+                            f"{n_exit} holding(s):** {top_bits}")
+                    else:
+                        st.success(
+                            "✅ No SWP exits right now — no holding is in a locked "
+                            "downtrend or topping on this stack.")
+
+                    st.dataframe(
+                        swp_df.style.apply(_swp_row_color, axis=1),
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            "_amt": None, "_color": None,
+                            "Ticker": st.column_config.LinkColumn(
+                                "Ticker", display_text=r"symbol=(.+)$"),
+                            "Gain %": st.column_config.NumberColumn(
+                                "Gain %", format="%.1f%%"),
+                            "Trend": st.column_config.TextColumn(
+                                "Trend", help="Current Supertrend direction of the anchor "
+                                "(largest) timeframe in the selected stack"),
+                            "Reversal Score": st.column_config.ProgressColumn(
+                                "Reversal Score", help="0–100. On the exit side a Bearish "
+                                "trend with a LOW score = downtrend locked (SWP hardest); "
+                                "a Bullish trend with a HIGH score = topping (start SWP)",
+                                min_value=0, max_value=100, format="%d"),
+                            "Score 1w ago": st.column_config.NumberColumn(
+                                "Score 1w ago", help="Reversal score ~1 week ago",
+                                format="%d"),
+                            "SWP %": st.column_config.NumberColumn(
+                                "SWP %", help="% of this holding to withdraw now",
+                                format="%d%%"),
+                            "ST flip/stop": st.column_config.NumberColumn(
+                                "ST flip/stop", help="Anchor Supertrend line — the level "
+                                "price must reclaim to flip bullish (a close back above it "
+                                "stops the SWP)", format="%.2f"),
+                            "Price": st.column_config.NumberColumn("Price", format="%.2f"),
+                        },
+                    )
+                    st.download_button(
+                        "⬇️ Download SWP exit plan",
+                        swp_df.drop(columns=["_amt", "_color"]).to_csv(
+                            index=False).encode(),
+                        file_name=f"swp_exit_{'-'.join(selected_tf)}.csv",
+                        mime="text/csv", key="swp_dl")
+                    st.caption(
+                        "**SWP %** scales with how *locked* the reversal is: a Bearish "
+                        "holding withdraws 30/20/10% as the score sits below 20/40/55, then "
+                        "Holds once ≥55 (a bull flip is building). A Bullish holding starts "
+                        "a 6/12/20% SWP as the score climbs through 55/65/80 (a top "
+                        "building). **Shares to sell** = SWP % × quantity; rows are ordered "
+                        "by **Value freed**, largest exit first. Order history nets down or "
+                        "cancels a tranche you've already sold this bar. Educational "
+                        "info, not investment advice."
+                    )
 
                 # =============== T1 / T2 / CE staged-exit plan ================
                 st.divider()
@@ -2139,18 +2188,21 @@ with tab_swp:
                 st.markdown(
                     "#### 💧 SIP deployment — bullish (low score) & reversal-imminent "
                     "(bearish, very high score) sectors")
-                if not any((swp_cash.get(m) or 0) > 0 for m in swp_markets):
+                if not any(
+                    (swp_total_capital.get(m) or 0) > 0 and
+                    (swp_cash.get(m) or 0) > 0
+                    for m in swp_markets
+                ):
                     st.caption(
-                        "Enter investable cash above to get a **diversified** SIP plan: "
-                        "cash is split across your bullish, low-reversal-score holdings "
-                        "(different sectors), tilted toward names near/below their "
-                        "10-day EMA, and reduced for names you already bought this bar. "
-                        "A small **starter** slice also goes to bearish names whose "
-                        f"reversal-to-Bull score is ≥ 90 (flip looks imminent).")
+                        "Enter both **total portfolio capital** and **cash in hand** "
+                        "above to size each actionable SIP at **4% of capital** using "
+                        f"the latest **{swp_bb_label} Bollinger midpoint**.")
                 else:
                     for _mk in swp_markets:
                         cash = swp_cash.get(_mk) or 0.0
-                        if cash <= 0:
+                        total_capital = swp_total_capital.get(_mk) or 0.0
+                        entry_budget = round(total_capital * 0.04, 2)
+                        if cash <= 0 or total_capital <= 0:
                             continue
                         msym = CCY_SYM.get(_mk, "")
                         cands = [c for c in sip_candidates
@@ -2160,60 +2212,42 @@ with tab_swp:
                                 f"**{_mk}:** no bullish (low-score) or reversal-"
                                 "imminent holding to SIP into right now.")
                             continue
-                        bull_cands = [c for c in cands
-                                      if not c.get("reversal_starter")]
-                        rev_cands = [c for c in cands if c.get("reversal_starter")]
-
-                        alloc_by = {}
-                        # (1) Reversal starters (bearish + very-high score) share a
-                        #     small bounded bucket so each stays "starter" size.
-                        if rev_cands:
-                            rev_pool = cash * 0.15
-                            twr = sum(c["weight"] for c in rev_cands) or 1.0
-                            for c in rev_cands:
-                                a = rev_pool * c["weight"] / twr
-                                alloc_by[id(c)] = min(a, cash * 0.05)  # ≤5% each
-                        remaining = cash - sum(alloc_by.values())
-
-                        # (2) Bullish low-score names split the remaining cash with a
-                        #     diversified (equal-weight) + conviction water-fill under
-                        #     a per-name cap so cash spreads across sectors.
-                        if bull_cands:
-                            n = len(bull_cands)
-                            tot_w = sum(c["weight"] for c in bull_cands) or 1.0
-                            fracs = {id(c): 0.5 / n + 0.5 * c["weight"] / tot_w
-                                     for c in bull_cands}
-                            cap = max(0.40, 1.0 / n)
-                            for _ in range(12):
-                                excess = 0.0
-                                under = []
-                                for c in bull_cands:
-                                    k = id(c)
-                                    if fracs[k] > cap + 1e-9:
-                                        excess += fracs[k] - cap
-                                        fracs[k] = cap
-                                    else:
-                                        under.append(c)
-                                if excess <= 1e-9 or not under:
-                                    break
-                                tu = sum(fracs[id(c)] for c in under) or 1.0
-                                for c in under:
-                                    fracs[id(c)] += excess * fracs[id(c)] / tu
-                            for c in bull_cands:
-                                alloc_by[id(c)] = remaining * fracs[id(c)]
 
                         sip_rows = []
+                        cash_remaining = cash
                         for c in cands:
-                            alloc = alloc_by.get(id(c), 0.0)
-                            sh = int(alloc // c["price"]) if c["price"] else 0
-                            spend = round(sh * c["price"], 2)
+                            bb_entry = bollinger_midpoint_cached(
+                                c["yf"], swp_bb_timeframe)
+                            entry_price = (
+                                bb_entry.get("midpoint") if bb_entry else None)
+                            if entry_price is None:
+                                sh = 0
+                                spend = 0.0
+                                sip_instruction = (
+                                    f"❔ {swp_bb_label} Bollinger midpoint unavailable")
+                            elif cash_remaining < entry_budget:
+                                sh = 0
+                                spend = 0.0
+                                sip_instruction = "⚠ Remaining cash below required 4%"
+                            else:
+                                sh = int(entry_budget // entry_price)
+                                spend = round(sh * entry_price, 2)
+                                sip_instruction = (
+                                    f"📌 SIP 4% at {swp_bb_label} BB midpoint"
+                                    if sh else "⚠ 4% allocation cannot buy one unit")
+                                if sh:
+                                    cash_remaining -= spend
                             add_pct = (round(spend / c["existing_value"] * 100, 1)
                                        if c.get("existing_value") else None)
                             stop_px = c.get("stop_px")
                             # Capital at risk on this entry = shares × (entry − stop).
-                            risk_amt = (round(sh * (c["price"] - stop_px), 2)
-                                        if (sh and stop_px and stop_px < c["price"])
+                            risk_amt = (round(sh * (entry_price - stop_px), 2)
+                                        if (sh and stop_px and stop_px < entry_price)
                                         else None)
+                            risk_pct = (
+                                round((entry_price - stop_px) / entry_price * 100, 2)
+                                if entry_price and stop_px and stop_px < entry_price
+                                else None)
                             stop_lbl = (round(stop_px, 2) if stop_px else None)
                             sip_rows.append({
                                 "_spend": spend,
@@ -2228,11 +2262,13 @@ with tab_swp:
                                 f"Existing {msym}": c.get("existing_value"),
                                 "Add %": add_pct,
                                 "Buy shares": sh,
+                                "4% SIP capital": entry_budget,
                                 f"Deploy {msym}": spend,
-                                "Price": c["price"],
+                                "BB midpoint entry": entry_price,
+                                "SIP instruction": sip_instruction,
                                 "Stop @": stop_lbl,
                                 "Stop basis": c.get("stop_basis"),
-                                "Risk %": c.get("risk_pct"),
+                                "Risk %": risk_pct,
                                 f"Risk {msym}": risk_amt,
                             })
                         deployed = sum(r["_spend"] for r in sip_rows)
@@ -2247,13 +2283,13 @@ with tab_swp:
                                   f"({risk_tot / deployed * 100:.0f}% of deployed)"
                                   if deployed else "")
                             st.success(
-                                f"💧 **{_mk} — SIP {msym}{deployed:,.0f} of "
-                                f"{msym}{cash:,.0f} ({deployed / cash * 100:.0f}%) "
-                                f"across {n_dep} sector(s):** {top}{rk}")
+                                f"💧 **{_mk} — SIP {msym}{deployed:,.0f} across "
+                                f"{n_dep} holding(s), each up to 4% of "
+                                f"{msym}{total_capital:,.0f}:** {top}{rk}")
                         else:
                             st.info(
-                                f"**{_mk}:** cash too small to buy a full share of any "
-                                "candidate at current prices.")
+                                f"**{_mk}:** no SIP entry is actionable with the "
+                                "available 4%-of-capital allocation and cash.")
                         sip_df = (pd.DataFrame(sip_rows)
                                   .sort_values("_spend", ascending=False)
                                   .drop(columns=["_spend", "_risk"])
@@ -2275,12 +2311,25 @@ with tab_swp:
                                 "Add %": st.column_config.NumberColumn(
                                     "Add %", help="Deploy amount as a % of your existing "
                                     "position value in this name", format="%.1f%%"),
+                                "4% SIP capital": st.column_config.NumberColumn(
+                                    "4% SIP capital", help="Standalone SIP allocation: "
+                                    "4% of the total portfolio capital entered above.",
+                                    format="%.2f"),
+                                "Buy shares": st.column_config.NumberColumn(
+                                    "Buy shares", help="Whole units purchasable at the "
+                                    "selected Bollinger midpoint.", format="%d"),
                                 f"Deploy {msym}": st.column_config.NumberColumn(
-                                    f"Deploy {msym}", help="Cash to deploy into this "
-                                    "name now", format="%.0f"),
+                                    f"Deploy {msym}", help="Amount used for whole units "
+                                    "at the selected Bollinger midpoint.", format="%.0f"),
                                 f"Existing {msym}": st.column_config.NumberColumn(
                                     f"Existing {msym}", format="%.0f"),
-                                "Price": st.column_config.NumberColumn("Price", format="%.2f"),
+                                "BB midpoint entry": st.column_config.NumberColumn(
+                                    "BB midpoint entry", help="Latest 20-period "
+                                    "Bollinger middle band on the selected timeframe.",
+                                    format="%.2f"),
+                                "SIP instruction": st.column_config.TextColumn(
+                                    "SIP instruction", help="A SIP is actionable only "
+                                    "when cash in hand covers its full 4% allocation."),
                                 "Stop @": st.column_config.NumberColumn(
                                     "Stop @", help="Protective stop-loss for this entry. "
                                     "Bullish → the Supertrend flip line (trailing trend "
@@ -2303,24 +2352,23 @@ with tab_swp:
                             file_name=f"swp_sip_{_mk}_{'-'.join(selected_tf)}.csv",
                             mime="text/csv", key=f"swp_sip_dl_{_mk}")
                     st.caption(
-                        "**How the SIP is sized:** each bullish holding with a reversal "
-                        "score < 55 gets a base weight (Strong < 20, SIP < 40, Light "
-                        "< 55), multiplied by a **10-day EMA** factor (×1.25 at/below "
-                        "the EMA, fading to ×0.4 when > 5% extended) and a **freshness** "
-                        "factor (×0.5 if already bought this bar). Bullish cash is then "
-                        "split **50% equally across sectors** (diversification) and "
-                        "**50% by conviction**, capped per name so no single sector hogs "
-                        "the deployment. A **reversal starter** bucket (max **15%** of "
-                        "cash, **≤ 5%** per name) is set aside first for **bearish** "
-                        "names whose reversal-to-Bull score is **≥ 90** — a small "
-                        "position ahead of a likely bear→bull flip. **Add %** = deploy ÷ "
-                        "your existing position. **Capital protection:** every entry "
-                        "carries a **stop-loss** — bullish names trail the **Supertrend "
-                        "flip line** (trend stop), reversal starters use **entry − "
-                        "1.5×ATR**; the **Risk %** and **Risk** columns show the downside "
+                        "**How the SIP is sized:** every qualifying holding gets a "
+                        "standalone allocation of **4% of your total portfolio capital**. "
+                        "The number of units and deployment amount use the latest "
+                        "**20-period Bollinger midpoint on 30-minute candles**. Rows "
+                        "become actionable in their displayed order only while remaining "
+                        "cash covers the full 4% allocation. A bullish holding qualifies "
+                        "when its reversal score is low; a bearish reversal starter "
+                        "qualifies only when its reversal-to-Bull score is **≥ 90**. "
+                        "**Add %** = deployment ÷ your existing position. **Capital "
+                        "protection:** every entry carries a stop-loss — bullish names "
+                        "trail the Supertrend flip line; reversal starters use entry − "
+                        "1.5×ATR. The **Risk %** and **Risk** columns show the downside "
                         "and cash at risk if the stop is hit. Educational info, not "
                         "investment advice."
                     )
+
+                _render_swp_reversal_table()
 
 
 with tab_exit:
@@ -3688,6 +3736,8 @@ with tab_st:
         "smaller anticipatory starter SIP). Set your **investable cash** below each "
         "market — rows are ordered by entry size (largest SIP first)."
     )
+    st_bb_timeframe, st_bb_label = bollinger_entry_timeframe_selector(
+        "st_bollinger_entry_timeframe")
 
     st_combo = ST_STACK_MAP.get(tuple(selected_tf), "1h+2h+4h+1d")
     anchor_tf = ST_COMBOS[st_combo][-1]
@@ -3768,20 +3818,20 @@ with tab_st:
         "1M change %": st.column_config.NumberColumn(
             "1M change %", help="Latest Yahoo market quote versus the most recent "
             "daily close at least one calendar month earlier.", format="%.2f%%"),
-        "30m BB midpoint entry": st.column_config.NumberColumn(
-            "30m BB midpoint entry", help="Latest 20-period Bollinger middle band "
-            "calculated from 30-minute candles; use it as the limit-entry level.",
+        "BB midpoint entry": st.column_config.NumberColumn(
+            "BB midpoint entry", help="Latest 20-period Bollinger middle band on the "
+            "timeframe selected above; use it as the limit-entry level.",
             format="%.2f"),
         "4% capital": st.column_config.NumberColumn(
             "4% capital", help="Standalone position size: 4% of the total portfolio "
             "capital entered above.", format="%.2f"),
         "Entry units": st.column_config.NumberColumn(
-            "Entry units", help="Whole units purchasable at the 30-minute Bollinger "
+            "Entry units", help="Whole units purchasable at the selected Bollinger "
             "midpoint entry "
             "price, only when cash in hand covers the full 4% allocation.", format="%d"),
         "Entry instruction": st.column_config.TextColumn(
-            "Entry instruction", help="Place a limit entry at the latest 30-minute "
-            "Bollinger middle band."),
+            "Entry instruction", help="Place a limit entry at the selected Bollinger "
+            "middle band."),
         "SIP action": st.column_config.TextColumn(
             "SIP action", help="Entry guidance. Deploy when the setup favours "
             "an uptrend: (a) a BULLISH anchor trend with a LOW reversal score "
@@ -3868,8 +3918,8 @@ with tab_st:
         if total_capital:
             st.caption(
                 f"**4% entry size:** {sym}{entry_budget:,.2f} per selected position. "
-                "The table uses the latest 30-minute Bollinger midpoint as the entry "
-                "price; "
+                f"The table uses the latest {st_bb_label} Bollinger midpoint as the "
+                "entry price; "
                 "choose one candidate rather than treating every row as a simultaneous "
                 "4% allocation.")
 
@@ -3883,19 +3933,20 @@ with tab_st:
             entry = _st_sip_entry(data.get("trend"), score)
             amt = round(cash * entry["pct"] / 100.0)
             performance = supertrend_performance_cached(s.ticker)
-            bb_30m = bollinger_midpoint_30m_cached(s.ticker)
-            entry_price = bb_30m.get("midpoint") if bb_30m else None
+            bb_entry = bollinger_midpoint_cached(s.ticker, st_bb_timeframe)
+            entry_price = bb_entry.get("midpoint") if bb_entry else None
             entry_units = (
                 int(entry_budget // entry_price)
                 if entry_budget and entry_price and cash >= entry_budget else None)
             if entry_price is None:
-                entry_instruction = "❔ 30m Bollinger midpoint unavailable"
+                entry_instruction = (
+                    f"❔ {st_bb_label} Bollinger midpoint unavailable")
             elif not total_capital:
                 entry_instruction = "Enter total capital"
             elif cash < entry_budget:
                 entry_instruction = "⚠ Cash below required 4%"
             else:
-                entry_instruction = "📌 Buy-limit at 30m BB midpoint"
+                entry_instruction = f"📌 Buy-limit at {st_bb_label} BB midpoint"
             rows.append({
                 "_score": score if score is not None else -1,
                 "_amt": amt,
@@ -3909,7 +3960,7 @@ with tab_st:
                     performance.get("daily_change") if performance else None),
                 "1M change %": (
                     performance.get("monthly_change") if performance else None),
-                "30m BB midpoint entry": entry_price,
+                "BB midpoint entry": entry_price,
                 "4% capital": entry_budget if total_capital else None,
                 "Entry units": entry_units,
                 "Entry instruction": entry_instruction,
