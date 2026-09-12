@@ -29,6 +29,7 @@
     "BSE.NS": "BSE",
     "CDSL.NS":"CDSL",
     "SMALLCAP.NS":"SMALLCAP",
-    "GOLDBEES.NS":"GOLDBEES"	
+    "GOLDBEES.NS":"GOLDBEES",
+    "BFSI.NS":"BFSI"	
   }
 }

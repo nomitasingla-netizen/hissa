@@ -53,6 +53,77 @@ def _resample_4h(df_1h: pd.DataFrame) -> pd.DataFrame:
     return _resample_intraday(df_1h, "4h")
 
 
+def _latest_session_date(df: pd.DataFrame):
+    """Return the date of the latest intraday session, preserving local exchange time."""
+    if df is None or df.empty:
+        return None
+    stamp = pd.Timestamp(df.index[-1])
+    if stamp.tzinfo is not None:
+        stamp = stamp.tz_localize(None)
+    return stamp.normalize()
+
+
+def _refresh_intraday_quote(hourly: pd.DataFrame, quote: dict) -> pd.DataFrame:
+    """Overlay a latest quote onto the final hourly bar when available."""
+    if hourly is None or hourly.empty or not quote.get("last_price"):
+        return hourly
+    refreshed = hourly.copy()
+    idx = refreshed.index[-1]
+    last = quote["last_price"]
+    refreshed.loc[idx, "Close"] = last
+    if quote.get("day_high") is not None:
+        refreshed.loc[idx, "High"] = max(
+            float(refreshed.loc[idx, "High"]), quote["day_high"], last)
+    if quote.get("day_low") is not None:
+        refreshed.loc[idx, "Low"] = min(
+            float(refreshed.loc[idx, "Low"]), quote["day_low"], last)
+    refreshed.attrs["latest_quote_applied"] = True
+    return refreshed
+
+
+def _merge_intraday_daily(daily: pd.DataFrame, hourly: pd.DataFrame,
+                          quote: dict) -> pd.DataFrame:
+    """Upsert the latest intraday session into daily OHLCV data."""
+    if hourly is None or hourly.empty:
+        return daily
+    session_day = _latest_session_date(hourly)
+    if session_day is None:
+        return daily
+
+    intraday_dates = pd.DatetimeIndex(hourly.index)
+    if intraday_dates.tz is not None:
+        mask = intraday_dates.tz_localize(None).normalize() == session_day
+    else:
+        mask = intraday_dates.normalize() == session_day
+    session = hourly.loc[mask]
+    if session.empty:
+        return daily
+
+    bar = {
+        "Open": float(session["Open"].iloc[0]),
+        "High": float(session["High"].max()),
+        "Low": float(session["Low"].min()),
+        "Close": float(quote.get("last_price") or session["Close"].iloc[-1]),
+        "Volume": float(quote.get("last_volume") or session["Volume"].sum()),
+    }
+    if quote.get("day_high") is not None:
+        bar["High"] = max(bar["High"], quote["day_high"], bar["Close"])
+    if quote.get("day_low") is not None:
+        bar["Low"] = min(bar["Low"], quote["day_low"], bar["Close"])
+    if quote.get("open") is not None:
+        bar["Open"] = quote["open"]
+
+    merged = daily.copy()
+    for column in merged.columns:
+        if column not in bar:
+            bar[column] = pd.NA
+    merged.loc[session_day, list(bar)] = pd.Series(bar)
+    merged = merged.sort_index()
+    merged.attrs["latest_session_date"] = session_day.strftime("%Y-%m-%d")
+    merged.attrs["latest_quote_applied"] = bool(quote.get("last_price"))
+    return merged
+
+
 def fetch_ohlcv(ticker: str) -> dict[str, pd.DataFrame]:
     """Return {'1h','2h','4h','1d','1wk'} of OHLCV data for a ticker.
 
@@ -64,6 +135,7 @@ def fetch_ohlcv(ticker: str) -> dict[str, pd.DataFrame]:
         "1h": pd.DataFrame(), "2h": pd.DataFrame(), "4h": pd.DataFrame(),
         "1d": pd.DataFrame(), "1wk": pd.DataFrame(),
     }
+    quote = fetch_latest_quote(ticker)
 
     try:
         daily = yf.download(
@@ -80,9 +152,18 @@ def fetch_ohlcv(ticker: str) -> dict[str, pd.DataFrame]:
             auto_adjust=True, progress=False, threads=False,
         )
         hourly = _drop_incomplete(_flatten(hourly))
+        hourly = _refresh_intraday_quote(hourly, quote)
         result["1h"] = hourly
         result["2h"] = _resample_intraday(hourly, "2h")
         result["4h"] = _resample_intraday(hourly, "4h")
+        result["1d"] = _merge_intraday_daily(result["1d"], hourly, quote)
+        session_day = _latest_session_date(hourly)
+        for key in ("1h", "2h", "4h", "1d"):
+            frame = result[key]
+            if frame is None or frame.empty or session_day is None:
+                continue
+            latest_day = _latest_session_date(frame)
+            frame.attrs["is_current_session"] = latest_day == session_day
     except Exception:
         pass
 
@@ -91,7 +172,13 @@ def fetch_ohlcv(ticker: str) -> dict[str, pd.DataFrame]:
             ticker, period=_WEEKLY_PERIOD, interval="1wk",
             auto_adjust=True, progress=False, threads=False,
         )
-        result["1wk"] = _drop_incomplete(_flatten(weekly))
+        weekly = _drop_incomplete(_flatten(weekly))
+        if not weekly.empty:
+            quote_price = quote.get("last_price")
+            weekly_close = float(weekly["Close"].iloc[-1])
+            weekly.attrs["is_current_session"] = bool(
+                quote_price and abs(weekly_close / quote_price - 1) < 0.002)
+        result["1wk"] = weekly
     except Exception:
         pass
 
@@ -108,6 +195,29 @@ def fetch_daily_ohlcv(ticker: str) -> pd.DataFrame:
         return _drop_incomplete(_flatten(daily))
     except Exception:
         return pd.DataFrame()
+
+
+def fetch_latest_quote(ticker: str) -> dict:
+    """Return Yahoo's latest quote and prior regular-session close, if available."""
+    try:
+        info = yf.Ticker(ticker).fast_info
+        last = info.get("lastPrice")
+        previous = (info.get("regularMarketPreviousClose")
+                    or info.get("previousClose"))
+        return {
+            "last_price": float(last) if last is not None else None,
+            "previous_close": float(previous) if previous is not None else None,
+            "open": float(info["open"]) if info.get("open") is not None else None,
+            "day_high": float(info["dayHigh"]) if info.get("dayHigh") is not None else None,
+            "day_low": float(info["dayLow"]) if info.get("dayLow") is not None else None,
+            "last_volume": (
+                float(info["lastVolume"]) if info.get("lastVolume") is not None else None),
+        }
+    except Exception:
+        return {
+            "last_price": None, "previous_close": None, "open": None,
+            "day_high": None, "day_low": None, "last_volume": None,
+        }
 
 
 def get_fund_info(ticker: str) -> dict:

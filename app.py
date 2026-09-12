@@ -11,7 +11,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from core.data import fetch_daily_ohlcv, fetch_ohlcv, truncate_frames, get_fund_info
+from core.data import fetch_daily_ohlcv, fetch_latest_quote, fetch_ohlcv, truncate_frames, get_fund_info
 import core.etfs as etfs
 import core.indicators as ind
 import core.stocks as stocks
@@ -159,6 +159,70 @@ def etf_buy_stats_cached(ticker: str) -> dict | None:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+def supertrend_performance_cached(ticker: str) -> dict | None:
+    """Return live-quote daily and one-calendar-month change for Supertrend rows."""
+    daily = load_frames(ticker).get("1d", pd.DataFrame())
+    if daily.empty or "Close" not in daily.columns:
+        return None
+    close = daily["Close"].astype(float).dropna()
+    if len(close) < 2:
+        return None
+    as_of = pd.Timestamp(close.index[-1])
+    one_month_ago = close.loc[close.index <= as_of - pd.DateOffset(months=1)]
+    if one_month_ago.empty:
+        return None
+    quote = fetch_latest_quote(ticker)
+    price = quote.get("last_price") or float(close.iloc[-1])
+    previous_close = quote.get("previous_close") or float(close.iloc[-2])
+    return {
+        "daily_change": round((price / previous_close - 1) * 100, 2),
+        "monthly_change": round((price / float(one_month_ago.iloc[-1]) - 1) * 100, 2),
+        "as_of": as_of.strftime("%Y-%m-%d"),
+    }
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def etf_bottom_confirmation_cached(ticker: str, tfs: tuple) -> dict | None:
+    """Return the bottoming checks used before averaging a bearish ETF."""
+    frames = load_frames(ticker)
+    daily = frames.get("1d", pd.DataFrame())
+    reversal = st_reversal_tf_cached(ticker, tfs)
+    if (daily.empty or len(daily) < 20 or reversal is None
+            or not {"High", "Low", "Close", "Volume"}.issubset(daily.columns)):
+        return None
+
+    close = daily["Close"].astype(float)
+    high = daily["High"].astype(float)
+    low = daily["Low"].astype(float)
+    volume = daily["Volume"].astype(float)
+    price = float(close.iloc[-1])
+    ema20 = float(ind.ema(close, 20).iloc[-1])
+    lookback = min(len(daily), 90)
+    low_window = low.iloc[-lookback:]
+    anchor = len(daily) - lookback + int(low_window.values.argmin())
+    avwap = float(ind.anchored_vwap(high, low, close, volume, anchor).iloc[-1])
+    lower_bulls = reversal.get("stack", "").count("🟢")
+
+    four_hour = supertrend_reversal(frames, ["4h"])
+    four_hour_bull = bool(four_hour and "Bull" in (four_hour.get("trend") or ""))
+    daily_bear = (
+        reversal.get("anchor") == "1d"
+        and "Bear" in (reversal.get("trend") or ""))
+    support_reclaimed = price >= ema20 or price >= avwap
+    return {
+        "price": price,
+        "reversal_score": reversal.get("score"),
+        "daily_bear": daily_bear,
+        "lower_bulls": lower_bulls,
+        "four_hour_bull": four_hour_bull,
+        "ema20": ema20,
+        "avwap": avwap,
+        "support_reclaimed": support_reclaimed,
+        "daily_flip_price": reversal.get("flip_price"),
+    }
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def st_reversal_cached(ticker: str) -> dict:
     """MTF Supertrend reversal read for any ticker (all combos), cached 15 min.
     Same data the Supertrend Reversal tab uses (``mtf_supertrend_all``)."""
@@ -219,7 +283,7 @@ tf_choice = st.sidebar.radio(
     ["Blend (4h + 1D)", "Blend (4h + 1D + 1W)", "Blend (1D + 1W)",
      "1D only", "4h only", "1W only",
      "MTF 1h+2h+4h", "MTF 1h+2h+4h+1D", "MTF 1h+2h+4h+1D+1W"],
-    index=0,
+    index=7,
     help="Which timeframe(s) the breakout/exit scores are based on. "
          "1W (weekly) captures the higher-timeframe trend. The **MTF** stacks add "
          "intraday 1h/2h bars — they re-score *every* tab on those timeframes and "
@@ -394,6 +458,15 @@ def run_scan(markets: list[str], lists: dict[str, dict], timeframes: tuple,
             score.imminence_1w_ago = imminence_snapshot(
                 ticker, name, frames, bench_frames, timeframes, "1w")
             score.st_mtf = mtf_supertrend_all(frames)
+            for st_data in score.st_mtf.values():
+                if not st_data:
+                    continue
+                anchor_frame = frames.get(st_data.get("anchor"), pd.DataFrame())
+                st_data["score_fallback"] = not bool(
+                    anchor_frame.attrs.get("is_current_session"))
+                st_data["score_as_of"] = (
+                    pd.Timestamp(anchor_frame.index[-1]).strftime("%Y-%m-%d")
+                    if not anchor_frame.empty else None)
             results.append((mkt, score))
         except Exception as exc:  # keep scanning even if one ticker fails
             st.warning(f"Failed to score {ticker}: {exc}")
@@ -457,7 +530,16 @@ if backtest and as_of_date:
         "validate the signal. Uncheck the sidebar option for live scores."
     )
 
+SCORE_INPUT_VERSION = "live-session-bars-v1"
+if st.session_state.get("score_input_version") != SCORE_INPUT_VERSION:
+    # Do not render session-persisted scores computed before a score-input change.
+    st.session_state["score_input_version"] = SCORE_INPUT_VERSION
+    st.session_state.pop("results", None)
+
 if run:
+    if not backtest:
+        # A live refresh must rebuild score inputs from the newest quote/session data.
+        cached_ohlcv.clear()
     st.session_state["results"] = run_scan(selected_markets, custom_lists, selected_tf, as_of_date)
 
 results = st.session_state.get("results", [])
@@ -3125,6 +3207,10 @@ with tab_ipo_ath:
 # --- ETF buying & selling instructions: standalone from sector scan ---
 with tab_etf_trade:
     st.subheader("🛒 ETF Buying & Selling Instructions")
+    st.info(
+        f"⏱️ **Supertrend timeframe: {tf_choice}** — Trend, Reversal Score, and "
+        "confirmed-bottom checks in this tab use this exact sidebar-selected stack."
+    )
     etf_market = st.selectbox(
         "Market", ["India", "US"], key="etf_trade_market",
         help="Selects the ETF universe, market timezone, currency, and close window.")
@@ -3132,16 +3218,45 @@ with tab_etf_trade:
     etf_currency = CCY_SYM.get(etf_market, "$")
     close_window_label = "3:15–3:30 PM IST" if etf_market == "India" else (
         "3:45–4:00 PM ET")
+    enforce_close_window = st.checkbox(
+        f"Require final 15-minute market-close window ({close_window_label})",
+        value=True, key="etf_trade_enforce_close_window",
+        help="When enabled, purchase instructions are limited to the final 15 minutes "
+        "of the selected market's regular session. It also limits US sell instructions "
+        "to that window.")
+    rule_col1, rule_col2 = st.columns(2)
+    with rule_col1:
+        enforce_one_buy = st.checkbox(
+            "Enforce one ETF buy per day", value=True,
+            key="etf_trade_enforce_one_buy",
+            help="Blocks a new ETF purchase when uploaded order history contains an ETF "
+            "buy in the selected market today.")
+    with rule_col2:
+        enforce_category_rotation = st.checkbox(
+            "Enforce category rotation", value=True,
+            key="etf_trade_enforce_category_rotation",
+            help="Excludes ETFs in the category of the most recently bought ETF in the "
+            "selected market.")
     st.caption(
         f"{etf_market} ETF pullback plan from `{etf_data_path.name}`: buy at most one ETF "
-        f"during the final 15 minutes of regular trading (**{close_window_label}**) "
+        f"{'during the final 15 minutes of regular trading (**' + close_window_label + '**) '
+          if enforce_close_window else 'at any time during the regular session '} "
         "when its one-day change is **≤−1%**, "
         "its 30-calendar-day change is **>−2.5%**, and its latest daily volume is "
         "above **500,000**. Eligible ETFs are ranked by the largest daily loss, then "
-        "the largest 30-day loss. The previous ETF buy's category is excluded."
+        "the largest 30-day loss. All configured ETFs are shown in the ranking. A held "
+        "ETF below its average cost with a daily change **>−1%** is prioritized for a "
+        "confirmed-bottom add-on: a bearish daily anchor, reversal score **≥65**, at "
+        "least two bullish lower timeframes, and price reclaiming its daily 20-EMA or "
+        "AVWAP. One-buy-per-day and category-rotation safeguards apply only when their "
+        "settings above are enabled."
     )
     buy_window_text, buy_window_open = market_last_15_window_status(etf_market)
-    if buy_window_open:
+    action_window_open = buy_window_open or not enforce_close_window
+    if not enforce_close_window:
+        st.info(
+            f"🕒 {buy_window_text} — close-window timing is **disabled** for this tab.")
+    elif buy_window_open:
         st.success(f"🟢 {buy_window_text}")
     else:
         st.warning(f"🕒 {buy_window_text} — no new purchase instruction will be issued.")
@@ -3157,6 +3272,12 @@ with tab_etf_trade:
                 f"Available cash ({etf_currency})", min_value=0.0, value=0.0, step=1000.0,
                 key="etf_trade_cash",
                 help="The selected buy receives exactly 10% of this cash balance.")
+            etf_total_capital = st.number_input(
+                f"Total capital ({etf_currency})", min_value=0.0, value=0.0, step=1000.0,
+                key="etf_trade_total_capital",
+                help="A confirmed-bottom ETF below its average cost receives a staged "
+                "add-on: 2% starter, then 3% after the 4h Supertrend turns bullish "
+                "(5% maximum total allocation).")
         with col_pos:
             etf_pos_upload = st.file_uploader(
                 "Positions CSV", type=["csv"], key="etf_trade_positions",
@@ -3166,8 +3287,8 @@ with tab_etf_trade:
             etf_order_uploads = st.file_uploader(
                 "Order history", type=["csv", "xlsx", "xls"],
                 accept_multiple_files=True, key="etf_trade_orders",
-                help="Required to enforce one ETF buy per day and avoid the category "
-                "of the most recently purchased ETF.")
+                help="Required only when enforcing one buy per day and/or category "
+                "rotation.")
 
         order_rows = []
         for order_file in etf_order_uploads or []:
@@ -3175,6 +3296,22 @@ with tab_etf_trade:
             order_rows.extend(orders)
         order_summary = summarize_orders(order_rows) if order_rows else {}
         category_by_yf = {item["yf"]: item["category"] for item in etf_universe}
+        etf_positions_by_yf = {}
+        if etf_pos_upload is not None:
+            uploaded_positions, _ = parse_positions_text(
+                etf_pos_upload.getvalue().decode("utf-8", errors="ignore"))
+            for position in uploaded_positions:
+                if position.get("market") != etf_market:
+                    continue
+                yf = _etf_trade_symbol(position.get("symbol"), etf_market)
+                if yf not in category_by_yf:
+                    continue
+                order_symbol = yf[:-3] if etf_market == "India" else yf
+                hist = order_summary.get(f"{etf_market}:{order_symbol}")
+                avg_cost = (hist or {}).get("avg_buy") or position.get("avg")
+                etf_positions_by_yf[yf] = {
+                    "position": position, "avg_cost": avg_cost,
+                }
         try:
             from datetime import datetime
             from zoneinfo import ZoneInfo
@@ -3196,22 +3333,29 @@ with tab_etf_trade:
         bought_today = any(
             pd.Timestamp(order["date"]).date() == market_today for order in etf_buys)
 
-        if last_etf_buy:
+        history_needed = enforce_one_buy or enforce_category_rotation
+        if enforce_category_rotation and last_etf_buy:
             st.info(
                 f"Last recorded ETF buy: **{last_etf_buy['symbol']}** "
                 f"({previous_category}) on **{pd.Timestamp(last_etf_buy['date']).date()}**. "
                 f"That category is excluded from the next purchase.")
-        else:
+        elif history_needed and not order_rows:
             st.info(
-                "Upload order history to enforce the one-buy-per-day and "
-                "previous-category rules. Until then, no buy instruction is issued.")
+                "Upload order history to enforce the selected one-buy-per-day and/or "
+                "category-rotation safeguard.")
+        elif enforce_category_rotation:
+            st.caption(
+                "No previous ETF purchase was found in the uploaded order history, so "
+                "no category is currently excluded.")
 
         run_etf_screen = st.button(
             "▶️ Screen ETF pullbacks", type="primary", key="etf_trade_screen",
-            help=f"Fetch latest daily data only for ETFs in {etf_data_path.name}.")
+            help=f"Fetch daily performance and selected-stack Supertrend data for ETFs in "
+            f"{etf_data_path.name}.")
         if run_etf_screen:
             rows, skipped = [], 0
-            progress = st.progress(0.0, text="Checking ETF daily change, 30-day change, and volume…")
+            progress = st.progress(
+                0.0, text="Checking ETF performance and Supertrend reversal data…")
             for index, item in enumerate(etf_universe, start=1):
                 progress.progress(
                     index / len(etf_universe),
@@ -3220,12 +3364,15 @@ with tab_etf_trade:
                 if stats is None:
                     skipped += 1
                     continue
+                reversal = st_reversal_tf_cached(item["yf"], tuple(selected_tf))
                 rows.append({
                     "Ticker": tradingview_url(item["yf"]),
                     "ETF": item["symbol"],
                     "Category": item["category"],
                     "1D change %": stats["daily_change"],
                     "30D change %": stats["monthly_change"],
+                    "Trend": reversal.get("trend") if reversal else "—",
+                    "Reversal Score": reversal.get("score") if reversal else None,
                     "Daily volume": int(stats["volume"]),
                     "Price": stats["price"],
                     "As of": stats["as_of"],
@@ -3234,35 +3381,67 @@ with tab_etf_trade:
             st.session_state["etf_trade_rows"] = rows
             st.session_state["etf_trade_skipped"] = skipped
             st.session_state["etf_trade_scan_market"] = etf_market
+            st.session_state["etf_trade_scan_tf"] = tuple(selected_tf)
 
         screen_rows = (
             st.session_state.get("etf_trade_rows")
-            if st.session_state.get("etf_trade_scan_market") == etf_market else None)
+            if (st.session_state.get("etf_trade_scan_market") == etf_market
+                and st.session_state.get("etf_trade_scan_tf") == tuple(selected_tf))
+            else None)
         if screen_rows is None:
-            st.info("👆 Click **Screen ETF pullbacks** to generate the ranked ETF list.")
+            st.info(
+                "👆 Click **Screen ETF pullbacks** to generate the ranked ETF list "
+                "for the currently selected market and timeframe stack.")
         else:
-            qualified = [
+            def _etf_trend_priority(row):
+                """Prioritize reversal setups before daily/monthly pullback depth."""
+                score = row.get("Reversal Score")
+                trend = row.get("Trend") or ""
+                daily = row["1D change %"]
+                monthly = row["30D change %"]
+                if score is None:
+                    return (4, 0, daily, monthly, row["ETF"])
+                bullish = "Bull" in trend
+                high_reversal = score >= 55
+                if not bullish and high_reversal:
+                    # Bearish but reversal pressure is high: a bull flip may be near.
+                    return (0, -score, daily, monthly, row["ETF"])
+                if bullish and not high_reversal:
+                    # Bullish and low reversal pressure: strongest intact trend.
+                    return (1, score, daily, monthly, row["ETF"])
+                if bullish:
+                    # Bullish but high reversal pressure: potential topping risk.
+                    return (2, -score, daily, monthly, row["ETF"])
+                # Bearish and low reversal pressure: downtrend remains locked.
+                return (3, score, daily, monthly, row["ETF"])
+
+            ranked = sorted(
+                screen_rows,
+                key=_etf_trend_priority,
+            )
+            pullback_qualified = [
                 row for row in screen_rows
                 if row["1D change %"] <= -1
                 and row["30D change %"] > -2.5
                 and row["Daily volume"] > 500_000
             ]
-            ranked = sorted(
-                qualified,
-                key=lambda row: (row["1D change %"], row["30D change %"], row["ETF"]),
+            pullback_qualified = sorted(
+                pullback_qualified,
+                key=_etf_trend_priority,
             )
-            available = [
-                row for row in ranked if row["Category"] != previous_category]
+            pullback_available = [
+                row for row in pullback_qualified
+                if (not enforce_category_rotation
+                    or row["Category"] != previous_category)]
 
-            st.markdown("#### 📉 Ranked ETF pullbacks")
+            st.markdown("#### 📉 Ranked ETFs — all configured symbols")
             if not ranked:
-                st.info(
-                    "No ETF currently satisfies all purchase filters: 1D change ≤−1%, "
-                    "30D change >−2.5%, and daily volume >500,000.")
+                st.info("No ETF daily data is available from the selected universe.")
             else:
-                # Keep the ranking deliberately compact: the strategy ranks only
-                # daily and monthly declines, while category rules control selection.
-                ranking_df = pd.DataFrame(ranked)[["Ticker", "1D change %", "30D change %"]]
+                # Supertrend priority defines the group order; daily and monthly
+                # change are tie-breakers within the group.
+                ranking_df = pd.DataFrame(ranked)[[
+                    "Ticker", "1D change %", "30D change %", "Trend", "Reversal Score"]]
                 st.dataframe(
                     ranking_df, use_container_width=True, hide_index=True,
                     column_config={
@@ -3272,57 +3451,136 @@ with tab_etf_trade:
                             "1D change %", format="%.2f%%"),
                         "30D change %": st.column_config.NumberColumn(
                             "30D change %", format="%.2f%%"),
+                        "Trend": st.column_config.TextColumn(
+                            "Trend", help="Anchor Supertrend direction from the "
+                            "sidebar-selected timeframe stack."),
+                        "Reversal Score": st.column_config.ProgressColumn(
+                            "Reversal Score", help="Same 0–100 Supertrend reversal "
+                            "score as the Supertrend Reversal tab. Higher = the "
+                            "current anchor trend is more likely to reverse soon.",
+                            min_value=0, max_value=100, format="%d"),
                     },
                 )
                 st.caption(
-                    f"{len(ranked)} qualified ETF(s); "
+                    "**Order:** bearish + score ≥55, bullish + score <55, bullish + "
+                    "score ≥55, then bearish + score <55. Within each group, 1D and "
+                    "30D change are ascending. "
+                    f"{len(ranked)} ETF(s) ranked; {len(pullback_qualified)} meet the "
+                    "10%-cash new-purchase filters; "
                     f"{st.session_state.get('etf_trade_skipped', 0)} skipped for insufficient data.")
 
-            pick = available[0] if available else None
-            if bought_today:
+            bottom_checks = {}
+            for yf in etf_positions_by_yf:
+                bottom = etf_bottom_confirmation_cached(yf, tuple(selected_tf))
+                if bottom is not None:
+                    bottom_checks[yf] = bottom
+
+            add_on_candidates = []
+            for row in ranked:
+                yf = _etf_trade_symbol(row["ETF"], etf_market)
+                holding = etf_positions_by_yf.get(yf)
+                avg_cost = holding.get("avg_cost") if holding else None
+                bottom = bottom_checks.get(yf)
+                if (avg_cost and row["Price"] < avg_cost
+                        and row["1D change %"] > -1
+                        and row["30D change %"] > -2.5
+                        and row["Daily volume"] > 500_000
+                        and bottom
+                        and bottom["daily_bear"]
+                        and (bottom["reversal_score"] or 0) >= 65
+                        and bottom["lower_bulls"] >= 2
+                        and bottom["support_reclaimed"]):
+                    stage_pct = 3 if bottom["four_hour_bull"] else 2
+                    add_on_candidates.append(dict(
+                        row, _stage_pct=stage_pct, _bottom=bottom))
+            add_on_available = [
+                row for row in add_on_candidates
+                if (not enforce_category_rotation
+                    or row["Category"] != previous_category)]
+            add_on_pick = add_on_available[0] if add_on_available else None
+            pullback_pick = pullback_available[0] if pullback_available else None
+            pick = add_on_pick or pullback_pick
+            is_add_on = add_on_pick is not None
+            if history_needed and not order_rows:
+                st.warning(
+                    "✋ **Buy blocked:** upload order history to enforce the selected "
+                    "buy safeguard(s), or disable those settings.")
+            elif enforce_one_buy and bought_today:
                 st.warning(
                     "✋ **No buy today:** uploaded order history already records an ETF "
                     "purchase today. This strategy permits only one ETF buy per day.")
-            elif not last_etf_buy:
-                st.warning(
-                    "✋ **Buy blocked:** upload order history before acting so the app can "
-                    "enforce one buy per day and category rotation.")
             elif not pick:
                 if ranked:
-                    st.warning(
-                        f"✋ **No buy:** every qualified ETF is in the previously bought "
-                        f"**{previous_category}** category.")
-            elif not buy_window_open:
+                    if enforce_category_rotation and previous_category:
+                        st.warning(
+                            f"✋ **No buy:** no qualifying ETF is outside the previously "
+                            f"bought **{previous_category}** category.")
+                    else:
+                        st.warning("✋ **No buy:** no ETF meets the active purchase rules.")
+            elif not action_window_open:
                 st.info(
                     f"⏳ Top eligible ETF is **{pick['ETF']}** ({pick['Category']}); "
                     "the purchase window is closed, so do not place the order yet.")
-            elif etf_cash <= 0:
+            elif is_add_on and etf_total_capital <= 0:
+                st.info(
+                    f"Top confirmed-bottom ETF below average cost is **{pick['ETF']}** "
+                    f"({pick['Category']}). Enter total capital to calculate the "
+                    "staged add-on allocation.")
+            elif not is_add_on and etf_cash <= 0:
                 st.info(
                     f"Top eligible ETF is **{pick['ETF']}** ({pick['Category']}). "
                     "Enter available cash to calculate the 10% allocation.")
             else:
-                allocation = round(etf_cash * 0.10, 2)
+                allocation = round(
+                    etf_total_capital * pick["_stage_pct"] / 100
+                    if is_add_on else etf_cash * 0.10, 2)
                 shares = int(allocation // pick["Price"]) if pick["Price"] else 0
                 spend = round(shares * pick["Price"], 2)
-                st.success(
-                    f"🟢 **BUY {pick['ETF']} — {pick['Category']}:** allocate up to "
-                    f"{etf_currency}{allocation:,.2f} (10% of cash), approximately "
-                    f"**{shares} units** at {etf_currency}{pick['Price']:,.2f}; "
-                    f"estimated spend {etf_currency}{spend:,.2f}. "
-                    f"Today: {pick['1D change %']:.2f}% · 30D: {pick['30D change %']:.2f}%.")
+                if is_add_on:
+                    avg_cost = etf_positions_by_yf[
+                        _etf_trade_symbol(pick["ETF"], etf_market)]["avg_cost"]
+                    bottom = pick["_bottom"]
+                    stage = (
+                        "3% confirmation add"
+                        if pick["_stage_pct"] == 3 else "2% starter")
+                    st.success(
+                        f"🟢 **INVEST MORE in {pick['ETF']} — {pick['Category']}:** "
+                        f"latest price {etf_currency}{pick['Price']:,.2f} is below your "
+                        f"average cost of {etf_currency}{avg_cost:,.2f}. **{stage}:** "
+                        f"reversal score {bottom['reversal_score']:.0f}, "
+                        f"{bottom['lower_bulls']} bullish lower timeframe(s), and "
+                        f"price reclaimed the daily "
+                        f"{'20-EMA' if pick['Price'] >= bottom['ema20'] else 'AVWAP'}. "
+                        f"Allocate up to {etf_currency}{allocation:,.2f} "
+                        f"({pick['_stage_pct']}% of total capital), approximately "
+                        f"**{shares} units**; estimated spend {etf_currency}{spend:,.2f}.")
+                else:
+                    st.success(
+                        f"🟢 **BUY {pick['ETF']} — {pick['Category']}:** allocate up to "
+                        f"{etf_currency}{allocation:,.2f} (10% of cash), approximately "
+                        f"**{shares} units** at {etf_currency}{pick['Price']:,.2f}; "
+                        f"estimated spend {etf_currency}{spend:,.2f}. "
+                        f"Today: {pick['1D change %']:.2f}% · 30D: {pick['30D change %']:.2f}%.")
 
         st.divider()
         sell_heading = (
             "#### 💰 US sell instructions — final 15 minutes, ≥3% return"
+            if etf_market == "US" and enforce_close_window else
+            "#### 💰 US sell instructions — ≥3% return"
             if etf_market == "US" else
             "#### 💰 Flexible sell instructions — ≥3% return")
         st.markdown(sell_heading)
-        if etf_market == "US":
+        if etf_market == "US" and enforce_close_window:
             st.caption(
                 "US sales are issued only during the final 15 minutes of regular "
                 "trading. Positions from the uploaded CSV are matched to the configured "
                 "ETF list; a sell is shown only when the latest price is more than 3% "
                 "above your recorded average cost.")
+        elif etf_market == "US":
+            st.caption(
+                "US close-window timing is disabled. Positions from the uploaded CSV "
+                "are matched to the configured ETF list; a sell is shown only when the "
+                "latest price is more than 3% above your recorded average cost.")
         else:
             st.caption(
                 "India sales have no time-window restriction. Positions from the uploaded "
@@ -3361,7 +3619,7 @@ with tab_etf_trade:
                     "Return %": return_pct,
                     "Sell instruction": (
                         "🟢 SELL — return above 3%"
-                        if etf_market != "US" or buy_window_open
+                        if etf_market != "US" or action_window_open
                         else "🕒 SELL window closed — wait for final 15 min"),
                     f"Estimated value {etf_currency}": round(qty * price, 2),
                 })
@@ -3387,9 +3645,9 @@ with tab_etf_trade:
 
     st.caption(
         "The daily bar and volume can still be forming during the final 15 minutes. "
-        "US buys and sells are both gated to that window; India buys are gated while "
-        "India sell timing remains flexible. This tab produces instructions only; it "
-        "does not place broker orders. Educational information, not investment advice.")
+        "When enabled, the final-15-minute setting gates US buys and sells and India "
+        "buys; India sell timing remains flexible. This tab produces instructions only; "
+        "it does not place broker orders. Educational information, not investment advice.")
 
 
 # --- Gate: scanner tabs need a scan; the tabs above do not ---
@@ -3472,15 +3730,27 @@ with tab_st:
         c = row["_color"]
         style = (f"background-color: {c}; color: #ffffff; font-weight: 600"
                  if c else "")
-        return [style] * len(row)
+        styles = [style] * len(row)
+        if row.get("_score_fallback"):
+            score_col = row.index.get_loc("Reversal Score")
+            styles[score_col] = (
+                "background-color: #f9a8d4; color: #831843; font-weight: 700")
+        return styles
 
     st_colcfg = {
-        "_score": None, "_color": None, "_amt": None,
+        "_score": None, "_color": None, "_amt": None, "_score_fallback": None,
         "Ticker": st.column_config.LinkColumn(
             "Ticker", display_text=r"symbol=(.+)$"),
         "Trend": st.column_config.TextColumn(
             "Trend", help=f"Current Supertrend direction of the anchor "
             f"({anchor_tf}) timeframe"),
+        "1D change %": st.column_config.NumberColumn(
+            "1D change %", help="Latest Yahoo market quote versus the prior regular-"
+            "session close; falls back to daily OHLCV if the quote is unavailable.",
+            format="%.2f%%"),
+        "1M change %": st.column_config.NumberColumn(
+            "1M change %", help="Latest Yahoo market quote versus the most recent "
+            "daily close at least one calendar month earlier.", format="%.2f%%"),
         "SIP action": st.column_config.TextColumn(
             "SIP action", help="Entry guidance. Deploy when the setup favours "
             "an uptrend: (a) a BULLISH anchor trend with a LOW reversal score "
@@ -3565,14 +3835,20 @@ with tab_st:
             da = data.get("dist_atr")
             entry = _st_sip_entry(data.get("trend"), score)
             amt = round(cash * entry["pct"] / 100.0)
+            performance = supertrend_performance_cached(s.ticker)
             rows.append({
                 "_score": score if score is not None else -1,
                 "_amt": amt,
                 "_color": _st_color(score),
+                "_score_fallback": data.get("score_fallback", True),
                 "Ticker": tradingview_url(s.ticker),
                 "Symbol": s.ticker,
                 "Sector": s.name,
                 "Trend": data.get("trend"),
+                "1D change %": (
+                    performance.get("daily_change") if performance else None),
+                "1M change %": (
+                    performance.get("monthly_change") if performance else None),
                 "SIP action": entry["label"],
                 "SIP %": entry["pct"],
                 "SIP amount": f"{sym}{amt:,.0f}" if entry["pct"] > 0 else "—",
@@ -3637,7 +3913,9 @@ with tab_st:
         "the lower timeframes are flipping one-by-one against the anchor trend and the "
         "anchor price is closing in on its Supertrend line — a reversal is building. "
         "Use it as an **early lead** on daily/weekly Supertrend flips, then confirm on "
-        "the anchor timeframe itself. Educational info, not investment advice."
+        "the anchor timeframe itself. A **pink Reversal Score** means its anchor input "
+        "was unavailable for the latest session and the score is using older data. "
+        "Educational info, not investment advice."
     )
 
 
