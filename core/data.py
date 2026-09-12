@@ -10,6 +10,7 @@ import yfinance as yf
 
 # yfinance limits intraday (<=1h) history to ~730 days.
 _INTRADAY_PERIOD = "180d"
+_ENTRY_INTRADAY_PERIOD = "60d"
 _DAILY_PERIOD = "2y"
 # Weekly uses a long window so the 200-week moving average has enough history.
 _WEEKLY_PERIOD = "10y"
@@ -193,6 +194,18 @@ def fetch_daily_ohlcv(ticker: str) -> pd.DataFrame:
             auto_adjust=True, progress=False, threads=False,
         )
         return _drop_incomplete(_flatten(daily))
+    except Exception:
+        return pd.DataFrame()
+
+
+def fetch_30m_ohlcv(ticker: str) -> pd.DataFrame:
+    """Fetch 30-minute OHLCV for short-term Bollinger entry levels."""
+    try:
+        intraday = yf.download(
+            ticker, period=_ENTRY_INTRADAY_PERIOD, interval="30m",
+            auto_adjust=True, progress=False, threads=False,
+        )
+        return _drop_incomplete(_flatten(intraday))
     except Exception:
         return pd.DataFrame()
 

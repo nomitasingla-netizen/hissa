@@ -11,7 +11,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from core.data import fetch_daily_ohlcv, fetch_latest_quote, fetch_ohlcv, truncate_frames, get_fund_info
+from core.data import fetch_30m_ohlcv, fetch_daily_ohlcv, fetch_latest_quote, fetch_ohlcv, truncate_frames, get_fund_info
 import core.etfs as etfs
 import core.indicators as ind
 import core.stocks as stocks
@@ -178,6 +178,22 @@ def supertrend_performance_cached(ticker: str) -> dict | None:
         "daily_change": round((price / previous_close - 1) * 100, 2),
         "monthly_change": round((price / float(one_month_ago.iloc[-1]) - 1) * 100, 2),
         "as_of": as_of.strftime("%Y-%m-%d"),
+    }
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def bollinger_midpoint_30m_cached(ticker: str) -> dict | None:
+    """Return the latest 20-period Bollinger midpoint from 30-minute candles."""
+    candles = fetch_30m_ohlcv(ticker)
+    if candles.empty or len(candles) < 20 or "Close" not in candles.columns:
+        return None
+    mid, _, _, _ = ind.bollinger(candles["Close"].astype(float), window=20)
+    value = mid.iloc[-1]
+    if pd.isna(value):
+        return None
+    return {
+        "midpoint": float(value),
+        "as_of": pd.Timestamp(candles.index[-1]).strftime("%Y-%m-%d %H:%M"),
     }
 
 
@@ -540,6 +556,7 @@ if run:
     if not backtest:
         # A live refresh must rebuild score inputs from the newest quote/session data.
         cached_ohlcv.clear()
+        bollinger_midpoint_30m_cached.clear()
     st.session_state["results"] = run_scan(selected_markets, custom_lists, selected_tf, as_of_date)
 
 results = st.session_state.get("results", [])
@@ -3751,6 +3768,20 @@ with tab_st:
         "1M change %": st.column_config.NumberColumn(
             "1M change %", help="Latest Yahoo market quote versus the most recent "
             "daily close at least one calendar month earlier.", format="%.2f%%"),
+        "30m BB midpoint entry": st.column_config.NumberColumn(
+            "30m BB midpoint entry", help="Latest 20-period Bollinger middle band "
+            "calculated from 30-minute candles; use it as the limit-entry level.",
+            format="%.2f"),
+        "4% capital": st.column_config.NumberColumn(
+            "4% capital", help="Standalone position size: 4% of the total portfolio "
+            "capital entered above.", format="%.2f"),
+        "Entry units": st.column_config.NumberColumn(
+            "Entry units", help="Whole units purchasable at the 30-minute Bollinger "
+            "midpoint entry "
+            "price, only when cash in hand covers the full 4% allocation.", format="%d"),
+        "Entry instruction": st.column_config.TextColumn(
+            "Entry instruction", help="Place a limit entry at the latest 30-minute "
+            "Bollinger middle band."),
         "SIP action": st.column_config.TextColumn(
             "SIP action", help="Entry guidance. Deploy when the setup favours "
             "an uptrend: (a) a BULLISH anchor trend with a LOW reversal score "
@@ -3817,14 +3848,30 @@ with tab_st:
 
         sym = CCY_SYM.get(mkt, "$")
         st.markdown(f"### {mkt} market")
-        cash = st.number_input(
-            f"💵 Investable cash to deploy ({mkt}, {sym})",
-            min_value=0.0, value=100000.0, step=1000.0,
-            key=f"st_cash_{mkt}",
-            help="Cash available for this market. Each row's SIP % is applied to "
-            "this to size the entry, and rows are ordered by entry size (largest "
-            "first).",
-        )
+        capital_col, cash_col = st.columns(2)
+        with capital_col:
+            total_capital = st.number_input(
+                f"Total portfolio capital ({mkt}, {sym})",
+                min_value=0.0, value=0.0, step=1000.0,
+                key=f"st_total_capital_{mkt}",
+                help="Each table row shows a standalone entry plan sized at 4% of "
+                "this total portfolio capital.")
+        with cash_col:
+            cash = st.number_input(
+                f"💵 Cash in hand ({mkt}, {sym})",
+                min_value=0.0, value=100000.0, step=1000.0,
+                key=f"st_cash_{mkt}",
+                help="Cash available for the existing SIP plan. It must also cover "
+                "the 4% total-capital entry amount before an entry is actionable.",
+            )
+        entry_budget = round(total_capital * 0.04, 2)
+        if total_capital:
+            st.caption(
+                f"**4% entry size:** {sym}{entry_budget:,.2f} per selected position. "
+                "The table uses the latest 30-minute Bollinger midpoint as the entry "
+                "price; "
+                "choose one candidate rather than treating every row as a simultaneous "
+                "4% allocation.")
 
         rows, ripe = [], []
         for s in pool:
@@ -3836,6 +3883,19 @@ with tab_st:
             entry = _st_sip_entry(data.get("trend"), score)
             amt = round(cash * entry["pct"] / 100.0)
             performance = supertrend_performance_cached(s.ticker)
+            bb_30m = bollinger_midpoint_30m_cached(s.ticker)
+            entry_price = bb_30m.get("midpoint") if bb_30m else None
+            entry_units = (
+                int(entry_budget // entry_price)
+                if entry_budget and entry_price and cash >= entry_budget else None)
+            if entry_price is None:
+                entry_instruction = "❔ 30m Bollinger midpoint unavailable"
+            elif not total_capital:
+                entry_instruction = "Enter total capital"
+            elif cash < entry_budget:
+                entry_instruction = "⚠ Cash below required 4%"
+            else:
+                entry_instruction = "📌 Buy-limit at 30m BB midpoint"
             rows.append({
                 "_score": score if score is not None else -1,
                 "_amt": amt,
@@ -3849,6 +3909,10 @@ with tab_st:
                     performance.get("daily_change") if performance else None),
                 "1M change %": (
                     performance.get("monthly_change") if performance else None),
+                "30m BB midpoint entry": entry_price,
+                "4% capital": entry_budget if total_capital else None,
+                "Entry units": entry_units,
+                "Entry instruction": entry_instruction,
                 "SIP action": entry["label"],
                 "SIP %": entry["pct"],
                 "SIP amount": f"{sym}{amt:,.0f}" if entry["pct"] > 0 else "—",
