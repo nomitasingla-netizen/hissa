@@ -4,3 +4,7 @@ __pycache__/
 # Local alert state & SMTP credentials — never commit
 alerts.json
 alert_config.json
+
+# Local Streamlit runtime logs
+streamlit.stdout.log
+streamlit.stderr.log
