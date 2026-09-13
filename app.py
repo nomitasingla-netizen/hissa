@@ -1664,15 +1664,27 @@ with tab_swp:
 
             swp_bb_timeframe, swp_bb_label = bollinger_entry_timeframe_selector(
                 "swp_bollinger_entry_timeframe")
+            exit_col, t2_col = st.columns(2)
+            with exit_col:
+                swp_use_ce = st.checkbox(
+                    "Use Chandelier Exit stop-loss", value=True,
+                    key="swp_use_ce",
+                    help="If price breaches the CE stop before T1, exit the whole "
+                    "position. After T1, CE protects the remaining shares.")
+            with t2_col:
+                swp_use_t2 = st.checkbox(
+                    "Use T2 runner target", value=True,
+                    key="swp_use_t2",
+                    help="When enabled, sell 40% at T1 and the remaining 60% at T2.")
             swp_rows = []
             ce_rows = []
             target_rows = []
             sip_candidates = []
             target_tf = next((tf for tf in PRIMARY_ORDER if tf in selected_tf),
                              _primary_tf(selected_tf))
-            # Bearish holdings whose reversal-to-Bull score is at/above this get a
-            # small "reversal starter" SIP ahead of a likely bear→bull flip.
+            ST_BULL_SIP_MAX = 15
             ST_REV_SIP_MIN = 90
+            SIP_MIN_DRAWDOWN_PCT = -1.0
             with st.spinner("Scoring your holdings on the Supertrend reversal…"):
                 for p in swp_positions:
                     try:
@@ -1731,34 +1743,26 @@ with tab_swp:
                              "#c2410c" if final_pct >= 6 else "")
 
                     # ---- SIP-entry candidacy ----
-                    # (a) Bullish + LOW reversal score → uptrend firmly intact, or
-                    # (b) Bearish + VERY HIGH reversal score → a bear→bull flip is
-                    #     imminent, so take a small "reversal starter" SIP.
+                    # Only average a holding at least 1% below its average cost when
+                    # its Supertrend setup is exceptionally favorable.
                     is_bull = isinstance(trend, str) and "Bull" in trend
                     is_bear = isinstance(trend, str) and "Bear" in trend
-                    bull_sip = is_bull and score is not None and score < 55
+                    avg_cost = p.get("avg")
+                    holding_change = (
+                        round((price / avg_cost - 1) * 100, 2)
+                        if price and avg_cost and avg_cost > 0 else None)
+                    bull_sip = (is_bull and score is not None
+                                and score < ST_BULL_SIP_MAX)
                     rev_sip = (is_bear and score is not None
-                               and score >= ST_REV_SIP_MIN)
-                    if (bull_sip or rev_sip) and price:
+                               and score > ST_REV_SIP_MIN)
+                    if ((bull_sip or rev_sip) and price
+                            and holding_change is not None
+                            and holding_change <= SIP_MIN_DRAWDOWN_PCT):
                         if bull_sip:
-                            tier_w, tier_lbl = ((1.0, "🟢 Strong") if score < 20 else
-                                                (0.66, "🟢 SIP") if score < 40 else
-                                                (0.33, "🟡 Light"))
+                            tier_lbl = "🟢 Strong SIP"
                         else:
-                            tier_w, tier_lbl = (0.25, "🔵 Reversal starter")
+                            tier_lbl = "🔵 Reversal starter"
                         ema_dist = sc.get("ema10_dist_pct")
-                        # Reward pullbacks toward/below the 10-day EMA; fade extension.
-                        if ema_dist is None:
-                            ema_f = 1.0
-                        elif ema_dist <= 0:
-                            ema_f = 1.25
-                        elif ema_dist <= 2:
-                            ema_f = 1.0
-                        elif ema_dist <= 5:
-                            ema_f = 0.7
-                        else:
-                            ema_f = 0.4
-                        # Freshness — down-weight a name you already bought this bar.
                         recent_buy = False
                         _ld = hist.get("last_date") if hist else None
                         if (hist and hist.get("last_side") == "buy"
@@ -1766,7 +1770,6 @@ with tab_swp:
                             _ds = (pd.Timestamp.now(tz=None).normalize()
                                    - pd.Timestamp(_ld).normalize()).days
                             recent_buy = _ds <= _bar_window_days(selected_tf)
-                        fresh_f = 0.5 if recent_buy else 1.0
                         # ---- Protective stop-loss (capital protection) ----
                         # Derive the anchor-timeframe ATR from the Supertrend fields:
                         # dist_atr = |price − flip| in ATR multiples ⇒ ATR = that ÷ dist.
@@ -1796,8 +1799,8 @@ with tab_swp:
                             "yf": p["yf"], "Symbol": p["symbol"], "Market": p["market"],
                             "price": price, "score": score, "ema_dist": ema_dist,
                             "trend": trend, "reversal_starter": rev_sip,
+                            "vs_avg_buy_pct": holding_change,
                             "existing_value": round((qty or 0) * price, 2),
-                            "weight": tier_w * ema_f * fresh_f,
                             "tier": tier_lbl, "fresh": not recent_buy,
                             "stop_px": stop_px, "stop_basis": stop_basis,
                             "risk_pct": risk_pct,
@@ -1884,21 +1887,31 @@ with tab_swp:
                     t1 = sc.get("target1")
                     t2 = sc.get("target")
                     ce_target = sc.get("ce_stop")
-                    t1_pct, t2_pct, ce_pct = 40, 30, 30
+                    t1_pct = 40 if swp_use_t2 else 100
+                    t2_pct = 60 if swp_use_t2 else 0
                     avg_buy = ((hist or {}).get("avg_buy") or p.get("avg"))
                     # Partition whole shares once so rounding staged tranches can
                     # never recommend more shares than the uploaded position.
                     t1_shares = min(int(round(qty * t1_pct / 100)), int(qty))
                     t2_shares = min(int(round(qty * t2_pct / 100)),
                                     max(0, int(qty) - t1_shares))
-                    ce_shares = max(0, int(qty) - t1_shares - t2_shares)
-                    for (target_name, target_price, planned_pct, max_stage_shares,
-                         is_stop, stage_tf) in (
+                    ce_breached = bool(ce_target and price and price <= ce_target)
+                    ce_pct = 100 if ce_breached else max(0, 100 - t1_pct - t2_pct)
+                    ce_shares = (
+                        int(qty) if ce_breached
+                        else max(0, int(qty) - t1_shares - t2_shares))
+                    target_stages = [
                         ("T1 · scale-out", t1, t1_pct, t1_shares, False, target_tf),
-                        ("T2 · runner", t2, t2_pct, t2_shares, False, target_tf),
-                        ("CE · stop-loss exit", ce_target, ce_pct, ce_shares, True,
-                         sc.get("ce_anchor") or target_tf),
-                    ):
+                    ]
+                    if swp_use_t2:
+                        target_stages.append(
+                            ("T2 · runner", t2, t2_pct, t2_shares, False, target_tf))
+                    if swp_use_ce:
+                        target_stages.append(
+                            ("CE · stop-loss exit", ce_target, ce_pct, ce_shares, True,
+                             sc.get("ce_anchor") or target_tf))
+                    for (target_name, target_price, planned_pct, max_stage_shares,
+                         is_stop, stage_tf) in target_stages:
                         if target_price is None or price is None:
                             continue
                         planned_label = (
@@ -2044,10 +2057,12 @@ with tab_swp:
                 st.markdown("#### 🎯 Profit targets — T1/T2 scale-out plan")
                 st.caption(
                     f"Targets use the sidebar-selected stack (**{' + '.join(selected_tf)}**) "
-                    f"and its primary target timeframe (**{target_tf}**). **T1 sells 40%** "
-                    "at first resistance, **T2 sells 30%** at the measured-move target, "
-                    "and the final **30%** is sold only after a completed close breaches "
-                    "the Chandelier long stop. A red row means its sale condition is met."
+                    f"and its primary target timeframe (**{target_tf}**). **T1 sells 100%** "
+                    "when T2 is disabled; when T2 is enabled, it sells **40%** at first "
+                    "resistance and T2 sells the remaining **60%** at the measured-move "
+                    "target. When CE is enabled, a stop "
+                    "breach before T1 exits the full position; otherwise it protects "
+                    "only shares not sold at T1/T2. A red row means its sale condition is met."
                 )
                 if not target_rows:
                     st.info("No profit-target data is available for the uploaded holdings.")
@@ -2104,9 +2119,11 @@ with tab_swp:
                         file_name=f"profit_targets_{'-'.join(selected_tf)}.csv",
                         mime="text/csv", key="profit_targets_dl")
                     st.caption(
-                        "**T1** sells 40%, **T2** sells 30%, and the final **CE stop-loss "
-                        "exit** sells 30% only after price breaches the displayed "
-                        "Chandelier long stop. The uploaded transaction history reduces "
+                        "**T1** sells 100% when T2 is disabled. When T2 is enabled, "
+                        "**T1** sells 40% and **T2** sells the remaining 60%; "
+                        "when enabled, a **CE stop-loss** sells 100% if breached before "
+                        "T1, otherwise only the unsold balance. The uploaded transaction "
+                        "history reduces "
                         "or suppresses a tranche already sold during the current target "
                         "bar. Confirm prices, share quantities, taxes, and order type "
                         "before placing trades. Educational info, not investment advice.")
@@ -2186,8 +2203,11 @@ with tab_swp:
                 # ================= SIP deployment (entry side) =================
                 st.divider()
                 st.markdown(
-                    "#### 💧 SIP deployment — bullish (low score) & reversal-imminent "
-                    "(bearish, very high score) sectors")
+                    "#### 💧 SIP deployment — extreme Supertrend pullback entries")
+                st.caption(
+                    "SIP only when the current holding is at least **1% below average "
+                    "cost**, and either the trend is **Bullish with reversal score <15** "
+                    "or **Bearish with reversal score >90**.")
                 if not any(
                     (swp_total_capital.get(m) or 0) > 0 and
                     (swp_cash.get(m) or 0) > 0
@@ -2209,8 +2229,8 @@ with tab_swp:
                                  if c["Market"] == _mk and c["price"]]
                         if not cands:
                             st.info(
-                                f"**{_mk}:** no bullish (low-score) or reversal-"
-                                "imminent holding to SIP into right now.")
+                                f"**{_mk}:** no holding meets the extreme Supertrend "
+                                "and at-least-1%-below-average-cost SIP rule right now.")
                             continue
 
                         sip_rows = []
@@ -2256,6 +2276,7 @@ with tab_swp:
                                 "Symbol": c["Symbol"],
                                 "Trend": c.get("trend"),
                                 "Reversal Score": c["score"],
+                                "Vs avg buy %": c["vs_avg_buy_pct"],
                                 "10-EMA dist %": c["ema_dist"],
                                 "SIP tier": c["tier"] + ("" if c["fresh"]
                                                          else " · recent buy"),
@@ -2300,9 +2321,13 @@ with tab_swp:
                                 "Ticker": st.column_config.LinkColumn(
                                     "Ticker", display_text=r"symbol=(.+)$"),
                                 "Reversal Score": st.column_config.ProgressColumn(
-                                    "Reversal Score", help="Lower = uptrend more firmly "
-                                    "intact → larger SIP tilt", min_value=0,
+                                    "Reversal Score", help="Eligible only when Bullish "
+                                    "is below 15 or Bearish is above 90.", min_value=0,
                                     max_value=100, format="%d"),
+                                "Vs avg buy %": st.column_config.NumberColumn(
+                                    "Vs avg buy %", help="Current price relative to "
+                                    "average holding cost. SIP requires ≤ -1.0%.",
+                                    format="%.2f%%"),
                                 "10-EMA dist %": st.column_config.NumberColumn(
                                     "10-EMA dist %", help="Price vs the 10-day EMA. "
                                     "≤ 0 = at/below the EMA (best pullback entry, "
@@ -2352,14 +2377,15 @@ with tab_swp:
                             file_name=f"swp_sip_{_mk}_{'-'.join(selected_tf)}.csv",
                             mime="text/csv", key=f"swp_sip_dl_{_mk}")
                     st.caption(
-                        "**How the SIP is sized:** every qualifying holding gets a "
+                        "**SIP eligibility:** a holding must be at least **1% below "
+                        "average cost** and either **Bullish with reversal score <15** "
+                        "or **Bearish with reversal score >90**. **How the SIP is "
+                        "sized:** every qualifying holding gets a "
                         "standalone allocation of **4% of your total portfolio capital**. "
                         "The number of units and deployment amount use the latest "
                         "**20-period Bollinger midpoint on 30-minute candles**. Rows "
                         "become actionable in their displayed order only while remaining "
-                        "cash covers the full 4% allocation. A bullish holding qualifies "
-                        "when its reversal score is low; a bearish reversal starter "
-                        "qualifies only when its reversal-to-Bull score is **≥ 90**. "
+                        "cash covers the full 4% allocation. "
                         "**Add %** = deployment ÷ your existing position. **Capital "
                         "protection:** every entry carries a stop-loss — bullish names "
                         "trail the Supertrend flip line; reversal starters use entry − "
