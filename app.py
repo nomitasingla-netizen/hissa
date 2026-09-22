@@ -199,6 +199,16 @@ def bollinger_midpoint_cached(ticker: str, timeframe: str) -> dict | None:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+def rsi_cached(ticker: str, timeframe: str) -> float | None:
+    """Return the latest 14-period RSI for a selected timeframe."""
+    frame = load_frames(ticker).get(timeframe, pd.DataFrame())
+    if frame.empty or len(frame) < 14 or "Close" not in frame.columns:
+        return None
+    value = ind.rsi(frame["Close"].astype(float)).iloc[-1]
+    return round(float(value), 1) if pd.notna(value) else None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def etf_bottom_confirmation_cached(ticker: str, tfs: tuple) -> dict | None:
     """Return the bottoming checks used before averaging a bearish ETF."""
     frames = load_frames(ticker)
@@ -587,6 +597,7 @@ if run:
         # A live refresh must rebuild score inputs from the newest quote/session data.
         cached_ohlcv.clear()
         bollinger_midpoint_cached.clear()
+        rsi_cached.clear()
     st.session_state["results"] = run_scan(selected_markets, custom_lists, selected_tf, as_of_date)
 
 results = st.session_state.get("results", [])
@@ -3844,6 +3855,9 @@ with tab_st:
         "1M change %": st.column_config.NumberColumn(
             "1M change %", help="Latest Yahoo market quote versus the most recent "
             "daily close at least one calendar month earlier.", format="%.2f%%"),
+        f"RSI ({anchor_tf})": st.column_config.NumberColumn(
+            f"RSI ({anchor_tf})", help=f"Latest 14-period RSI on the Supertrend "
+            f"anchor timeframe ({anchor_tf}).", format="%.1f"),
         "BB midpoint entry": st.column_config.NumberColumn(
             "BB midpoint entry", help="Latest 20-period Bollinger middle band on the "
             "timeframe selected above; use it as the limit-entry level.",
@@ -3956,6 +3970,7 @@ with tab_st:
                 continue
             score = data.get("score")
             da = data.get("dist_atr")
+            anchor_rsi = rsi_cached(s.ticker, anchor_tf)
             entry = _st_sip_entry(data.get("trend"), score)
             amt = round(cash * entry["pct"] / 100.0)
             performance = supertrend_performance_cached(s.ticker)
@@ -3986,6 +4001,7 @@ with tab_st:
                     performance.get("daily_change") if performance else None),
                 "1M change %": (
                     performance.get("monthly_change") if performance else None),
+                f"RSI ({anchor_tf})": anchor_rsi,
                 "BB midpoint entry": entry_price,
                 "4% capital": entry_budget if total_capital else None,
                 "Entry units": entry_units,
