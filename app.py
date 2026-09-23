@@ -209,6 +209,72 @@ def rsi_cached(ticker: str, timeframe: str) -> float | None:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+def macd_coil_cached(ticker: str, timeframe: str) -> dict | None:
+    """Score a near-zero MACD base followed by a bullish confirmation cross."""
+    frame = load_frames(ticker).get(timeframe, pd.DataFrame())
+    required = {"High", "Low", "Close"}
+    if frame.empty or len(frame) < 36 or not required.issubset(frame.columns):
+        return None
+
+    close = frame["Close"].astype(float)
+    macd_line, signal_line, histogram = ind.macd(close)
+    atr = ind.atr(frame["High"].astype(float), frame["Low"].astype(float), close)
+    values = pd.DataFrame({
+        "close": close,
+        "macd": macd_line,
+        "signal": signal_line,
+        "histogram": histogram,
+        "atr": atr,
+    }).dropna()
+    if len(values) < 9 or (values["atr"].tail(9) <= 0).any():
+        return None
+
+    base = values.iloc[-9:-1]
+    current = values.iloc[-1]
+    zero_atr = base[["macd", "signal"]].abs().max(axis=1) / base["atr"]
+    spread_atr = (base["macd"] - base["signal"]).abs() / base["atr"]
+    base_coil = (zero_atr <= 0.35) & (spread_atr <= 0.12)
+    coil_days = int(base_coil.sum())
+
+    zero_score = (1 - zero_atr / 0.35).clip(0, 1).mean() * 100
+    spread_score = (1 - spread_atr / 0.12).clip(0, 1).mean() * 100
+    base_score = base_coil.mean() * 100
+    recent = values.tail(4)
+    crosses = (
+        (recent["macd"] > recent["signal"])
+        & (recent["macd"].shift(1) <= recent["signal"].shift(1))
+    )
+    recent_cross_up = bool(crosses.iloc[1:].any())
+    histogram_positive = current["histogram"] > 0
+    histogram_rising = current["histogram"] > values["histogram"].iloc[-2]
+    confirmation_score = 20 if recent_cross_up else 0
+    histogram_score = 15 if histogram_positive and histogram_rising else (
+        8 if histogram_positive or histogram_rising else 0)
+    score = round(
+        0.25 * zero_score + 0.25 * spread_score + 0.40 * base_score
+        + confirmation_score + histogram_score)
+    score = min(score, 100)
+
+    current_near_zero = max(abs(current["macd"]), abs(current["signal"])) / current["atr"] <= 0.35
+    if coil_days >= 6 and recent_cross_up and histogram_positive and histogram_rising:
+        status = "Confirmed up-cross"
+    elif coil_days >= 6:
+        status = "Coiling - await cross"
+    elif recent_cross_up and histogram_positive:
+        status = "Up-cross - weak base"
+    else:
+        status = "No confirmation"
+    return {
+        "score": score,
+        "coil_days": coil_days,
+        "status": status,
+        "display": (
+            f"{score} | {status} | {'Near 0' if current_near_zero else 'Away from 0'} "
+            f"| Base {coil_days}/8"),
+    }
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def etf_bottom_confirmation_cached(ticker: str, tfs: tuple) -> dict | None:
     """Return the bottoming checks used before averaging a bearish ETF."""
     frames = load_frames(ticker)
@@ -598,6 +664,7 @@ if run:
         cached_ohlcv.clear()
         bollinger_midpoint_cached.clear()
         rsi_cached.clear()
+        macd_coil_cached.clear()
     st.session_state["results"] = run_scan(selected_markets, custom_lists, selected_tf, as_of_date)
 
 results = st.session_state.get("results", [])
@@ -3858,6 +3925,12 @@ with tab_st:
         f"RSI ({anchor_tf})": st.column_config.NumberColumn(
             f"RSI ({anchor_tf})", help=f"Latest 14-period RSI on the Supertrend "
             f"anchor timeframe ({anchor_tf}).", format="%.1f"),
+        f"MACD confirmation ({anchor_tf})": st.column_config.TextColumn(
+            f"MACD confirmation ({anchor_tf})",
+            help="0-100 confirmation score. The preceding 8 anchor bars form the "
+            "base: both MACD and signal must stay within 0.35 ATR of zero and within "
+            "0.12 ATR of each other. The current setup is confirmed by a MACD "
+            "up-cross within the latest 3 bars plus a positive, rising histogram."),
         "BB midpoint entry": st.column_config.NumberColumn(
             "BB midpoint entry", help="Latest 20-period Bollinger middle band on the "
             "timeframe selected above; use it as the limit-entry level.",
@@ -3971,6 +4044,7 @@ with tab_st:
             score = data.get("score")
             da = data.get("dist_atr")
             anchor_rsi = rsi_cached(s.ticker, anchor_tf)
+            macd_coil = macd_coil_cached(s.ticker, anchor_tf)
             entry = _st_sip_entry(data.get("trend"), score)
             amt = round(cash * entry["pct"] / 100.0)
             performance = supertrend_performance_cached(s.ticker)
@@ -4002,6 +4076,8 @@ with tab_st:
                 "1M change %": (
                     performance.get("monthly_change") if performance else None),
                 f"RSI ({anchor_tf})": anchor_rsi,
+                f"MACD confirmation ({anchor_tf})": (
+                    macd_coil.get("display") if macd_coil else "Unavailable"),
                 "BB midpoint entry": entry_price,
                 "4% capital": entry_budget if total_capital else None,
                 "Entry units": entry_units,
