@@ -6,17 +6,22 @@ from __future__ import annotations
 
 import math
 import os
+import re
+import json
+from io import StringIO
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import pandas as pd
 import streamlit as st
 
-from core.data import fetch_30m_ohlcv, fetch_daily_ohlcv, fetch_latest_quote, fetch_ohlcv, truncate_frames, get_fund_info
+from core.data import fetch_30m_ohlcv, fetch_all_time_highs, fetch_daily_ohlcv, fetch_latest_quote, fetch_ohlcv, truncate_frames, get_fund_info
 import core.etfs as etfs
 import core.indicators as ind
 import core.stocks as stocks
 from core.etfs import MARKETS, LOAD_ERRORS
-from core.scoring import score_sector, breakout_snapshot, imminence_snapshot, score_snapshot, lifecycle_stage, PRIMARY_ORDER, mtf_supertrend_all, ST_COMBOS, supertrend_reversal, _frames_back, ST_LOOKBACK
+from core.scoring import score_sector, breakout_snapshot, imminence_snapshot, score_snapshot, lifecycle_stage, PRIMARY_ORDER, mtf_supertrend_all, ST_COMBOS, supertrend_reversal, _frames_back, ST_LOOKBACK, SCALE_OUT_T1_PCT
 from core.patterns import detect_breakout_retest
 import core.ipos as ipos
 import core.alerts as alertmod
@@ -84,6 +89,136 @@ def cached_ohlcv(ticker: str) -> dict:
 
 def load_frames(ticker: str) -> dict:
     return cached_ohlcv(ticker)
+
+
+def parse_tradingview_stock_csv(csv_text: str) -> tuple[dict[str, dict[str, str]], list[str]]:
+    """Convert a TradingView stock export into yfinance ticker lists by market."""
+    try:
+        stocks_df = pd.read_csv(StringIO(csv_text), dtype=str, skipinitialspace=True)
+    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError,
+            UnicodeDecodeError) as exc:
+        return {"US": {}, "India": {}}, [f"Could not read CSV: {exc}"]
+
+    stocks_df.columns = [str(column).strip().lstrip("\ufeff") for column in stocks_df.columns]
+    if "Symbol" not in stocks_df.columns and "TV Code" not in stocks_df.columns:
+        return {"US": {}, "India": {}}, [
+            "CSV needs a Symbol or TV Code column (for example, NSE:RELIANCE)."
+        ]
+
+    markets = {"US": {}, "India": {}}
+    skipped = 0
+    for _, row in stocks_df.iterrows():
+        tv_code = str(row.get("TV Code", "") or "").strip().upper()
+        symbol = str(row.get("Symbol", "") or "").strip().upper()
+        match = re.search(r"\b(NSE|BSE|NASDAQ|NYSE|AMEX):([A-Z0-9&.-]+)", tv_code)
+        if match:
+            exchange, symbol = match.groups()
+        else:
+            exchange = ""
+
+        if not symbol or symbol == "NAN":
+            skipped += 1
+            continue
+        if exchange == "NSE" or symbol.endswith(".NS"):
+            market, ticker = "India", symbol.removesuffix(".NS") + ".NS"
+        elif exchange == "BSE" or symbol.endswith(".BO"):
+            market, ticker = "India", symbol.removesuffix(".BO") + ".BO"
+        elif exchange in {"NASDAQ", "NYSE", "AMEX"}:
+            market, ticker = "US", symbol
+        else:
+            skipped += 1
+            continue
+
+        description = str(row.get("Description", "") or "").strip()
+        sector = str(row.get("Sector", "") or "").strip()
+        name = description if description and description != "nan" else ticker
+        if sector and sector != "nan":
+            name = f"{name} · {sector}"
+        markets[market][ticker] = name
+
+    messages = []
+    if skipped:
+        messages.append(f"Skipped {skipped} row(s) without a supported exchange code.")
+    if not any(markets.values()):
+        messages.append("No supported NSE, BSE, NASDAQ, NYSE, or AMEX stocks found.")
+    return markets, messages
+
+
+NASDAQ_NDX_WEIGHTING_URL = "https://indexes.nasdaqomx.com/Index/WeightingData"
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def nasdaq100_constituents_cached() -> dict:
+    """Fetch the latest available Nasdaq-100 component list from Nasdaq."""
+    today = pd.Timestamp.now(tz="America/New_York").normalize()
+    latest_error = ""
+    for offset in range(10):
+        trade_date = (today - pd.Timedelta(days=offset)).strftime("%Y-%m-%d")
+        body = urlencode({
+            "id": "NDX",
+            "tradeDate": trade_date,
+            "timeOfDay": "",
+        }).encode()
+        request = Request(
+            NASDAQ_NDX_WEIGHTING_URL,
+            data=body,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://indexes.nasdaqomx.com/Index/Weighting/NDX",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                payload = json.load(response)
+        except (OSError, TimeoutError, json.JSONDecodeError) as exc:
+            latest_error = str(exc)
+            continue
+
+        rows = payload.get("aaData") or []
+        members = {
+            str(row.get("Symbol", "")).strip().upper(): str(
+                row.get("Name", "")).strip()
+            for row in rows
+            if row.get("Symbol")
+        }
+        if members:
+            return {"members": members, "as_of": trade_date, "error": ""}
+    return {
+        "members": {},
+        "as_of": None,
+        "error": latest_error or "No recent Nasdaq-100 component data was returned.",
+    }
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def nasdaq100_near_ath_cached(threshold_pct: float) -> dict:
+    """Return Nasdaq-100 stocks trading no more than ``threshold_pct`` below ATH."""
+    constituent_data = nasdaq100_constituents_cached()
+    members = constituent_data.get("members") or {}
+    if not members:
+        return {
+            "stocks": {},
+            "as_of": constituent_data.get("as_of"),
+            "error": constituent_data.get("error") or "Nasdaq-100 list unavailable.",
+        }
+
+    ath_data = fetch_all_time_highs(list(members))
+    qualifying = {}
+    for ticker, stats in ath_data.items():
+        pct_from_ath = stats.get("pct_from_ath")
+        if pct_from_ath is None or pct_from_ath < -threshold_pct:
+            continue
+        name = members.get(ticker) or ticker
+        qualifying[ticker] = (
+            f"{name} · Nasdaq-100 near ATH ({pct_from_ath:.1f}% from ATH)"
+        )
+    return {
+        "stocks": qualifying,
+        "as_of": constituent_data.get("as_of"),
+        "error": "",
+    }
 
 
 ETF_BUY_DATA_PATHS = {
@@ -199,6 +334,66 @@ def bollinger_midpoint_cached(ticker: str, timeframe: str) -> dict | None:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+def preferred_buy_zone_cached(ticker: str) -> dict | None:
+    """Return a normal-pullback buy zone from daily support and mean reversion.
+
+    The lower edge is the recent five-day daily low. The upper edge is the
+    nearest valid daily or four-hour EMA20 above that support, capped at half a
+    daily ATR so a stale moving average cannot create an impractically wide zone.
+    Current price is Within the band, Near when up to half a daily ATR above it,
+    Far beyond that, and Below when it has fallen through the lower edge.
+    """
+    frames = load_frames(ticker)
+    daily = frames.get("1d", pd.DataFrame())
+    four_hour = frames.get("4h", pd.DataFrame())
+    required = {"High", "Low", "Close"}
+    if (len(daily) < 20 or len(four_hour) < 20
+            or not required.issubset(daily.columns)
+            or "Close" not in four_hour.columns):
+        return None
+
+    daily_close = daily["Close"].astype(float)
+    daily_low = daily["Low"].astype(float)
+    four_hour_close = four_hour["Close"].astype(float)
+    lower = float(daily_low.tail(5).min())
+    daily_atr = float(ind.atr(
+        daily["High"].astype(float), daily_low, daily_close).iloc[-1])
+    if pd.isna(daily_atr) or daily_atr <= 0:
+        return None
+
+    mean_reversion_levels = [
+        float(ind.ema(daily_close, 20).iloc[-1]),
+        float(ind.ema(four_hour_close, 20).iloc[-1]),
+    ]
+    valid_levels = [
+        level for level in mean_reversion_levels
+        if not pd.isna(level) and level >= lower
+    ]
+    upper = min(valid_levels) if valid_levels else lower + 0.5 * daily_atr
+    upper = min(upper, lower + 0.5 * daily_atr)
+    if upper <= lower:
+        upper = lower + min(0.25 * daily_atr, max(lower * 0.0025, 0.01))
+
+    price = float(daily_close.iloc[-1])
+    if price < lower:
+        position = "🔵 Below"
+    elif price <= upper:
+        position = "🟢 Within"
+    elif price <= upper + 0.5 * daily_atr:
+        position = "🟡 Near"
+    else:
+        position = "🔴 Far"
+
+    return {
+        "lower": round(lower, 2),
+        "upper": round(upper, 2),
+        "sizing_price": round(upper, 2),
+        "position": position,
+        "as_of": pd.Timestamp(daily.index[-1]).strftime("%Y-%m-%d"),
+    }
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def rsi_cached(ticker: str, timeframe: str) -> float | None:
     """Return the latest 14-period RSI for a selected timeframe."""
     frame = load_frames(ticker).get(timeframe, pd.DataFrame())
@@ -268,6 +463,9 @@ def macd_coil_cached(ticker: str, timeframe: str) -> dict | None:
         "score": score,
         "coil_days": coil_days,
         "status": status,
+        "detail": (
+            f"{status} | {'Near 0' if current_near_zero else 'Away from 0'} "
+            f"| Base {coil_days}/8"),
         "display": (
             f"{score} | {status} | {'Near 0' if current_near_zero else 'Away from 0'} "
             f"| Base {coil_days}/8"),
@@ -511,6 +709,90 @@ for mkt in selected_markets:
     custom_lists[mkt] = parsed
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("📄 Supertrend stock-list CSV")
+st.sidebar.caption(
+    "Optionally add a TradingView stock export to the next scan. Supported exchange "
+    "codes: NSE, BSE, NASDAQ, NYSE, and AMEX."
+)
+stock_csv_upload = st.sidebar.file_uploader(
+    "Upload stock-list CSV", type=["csv"], key="supertrend_stock_csv_upload",
+)
+stock_csv_path = st.sidebar.text_input(
+    "Or local CSV path",
+    placeholder=r"C:\path\to\Dump of stocks.csv",
+    key="supertrend_stock_csv_path",
+)
+imported_stock_lists = {"US": {}, "India": {}}
+stock_csv_messages: list[str] = []
+stock_csv_source = ""
+if stock_csv_upload is not None:
+    imported_stock_lists, stock_csv_messages = parse_tradingview_stock_csv(
+        stock_csv_upload.getvalue().decode("utf-8-sig", errors="ignore"))
+    stock_csv_source = stock_csv_upload.name
+elif stock_csv_path.strip():
+    csv_path = Path(os.path.expandvars(stock_csv_path.strip())).expanduser()
+    try:
+        imported_stock_lists, stock_csv_messages = parse_tradingview_stock_csv(
+            csv_path.read_text(encoding="utf-8-sig", errors="ignore"))
+        stock_csv_source = str(csv_path)
+    except OSError as exc:
+        st.sidebar.error(f"Could not read stock-list CSV: {exc}")
+
+scan_markets = list(selected_markets)
+imported_count = 0
+for mkt, imported in imported_stock_lists.items():
+    if not imported:
+        continue
+    current = custom_lists.setdefault(mkt, {})
+    additions = {
+        ticker: name for ticker, name in imported.items()
+        if ticker not in current
+    }
+    current.update(additions)
+    imported_count += len(additions)
+    if mkt not in scan_markets:
+        scan_markets.append(mkt)
+
+if stock_csv_source:
+    st.sidebar.success(
+        f"Loaded {imported_count} additional stock(s) from {Path(stock_csv_source).name}. "
+        "Click Scan / Refresh to include them."
+    )
+for message in stock_csv_messages:
+    st.sidebar.warning(message)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🏔️ Nasdaq-100 near ATH")
+include_nasdaq100_near_ath = st.sidebar.checkbox(
+    "Add Nasdaq-100 stocks within 5% of ATH",
+    value=False,
+    help="Fetches current Nasdaq-100 components and adds only stocks trading no "
+    "more than 5% below their split-adjusted all-time high to the next scan.",
+)
+if include_nasdaq100_near_ath:
+    nasdaq_near_ath = nasdaq100_near_ath_cached(5.0)
+    nasdaq_stocks = nasdaq_near_ath.get("stocks") or {}
+    if nasdaq_near_ath.get("error"):
+        st.sidebar.error(
+            f"Could not load Nasdaq-100 near-ATH stocks: {nasdaq_near_ath['error']}"
+        )
+    elif not nasdaq_stocks:
+        st.sidebar.info("No Nasdaq-100 stocks are currently within 5% of ATH.")
+    else:
+        us_list = custom_lists.setdefault("US", {})
+        additions = {
+            ticker: name for ticker, name in nasdaq_stocks.items()
+            if ticker not in us_list
+        }
+        us_list.update(additions)
+        if "US" not in scan_markets:
+            scan_markets.append("US")
+        st.sidebar.success(
+            f"Loaded {len(additions)} Nasdaq-100 near-ATH stock(s) "
+            f"(components as of {nasdaq_near_ath.get('as_of')}). Click Scan / Refresh."
+        )
+
+st.sidebar.markdown("---")
 st.sidebar.subheader("📊 Display")
 show_aum = st.sidebar.checkbox(
     "Show fund size / AUM (slower)", value=False,
@@ -665,7 +947,7 @@ if run:
         bollinger_midpoint_cached.clear()
         rsi_cached.clear()
         macd_coil_cached.clear()
-    st.session_state["results"] = run_scan(selected_markets, custom_lists, selected_tf, as_of_date)
+    st.session_state["results"] = run_scan(scan_markets, custom_lists, selected_tf, as_of_date)
 
 results = st.session_state.get("results", [])
 scan_ready = bool(results)
@@ -1753,7 +2035,7 @@ with tab_swp:
                 swp_use_t2 = st.checkbox(
                     "Use T2 runner target", value=True,
                     key="swp_use_t2",
-                    help="When enabled, sell 40% at T1 and the remaining 60% at T2.")
+                    help="When enabled, sell 60% at T1 and the remaining 40% at T2.")
             swp_rows = []
             ce_rows = []
             target_rows = []
@@ -1960,13 +2242,13 @@ with tab_swp:
 
                     # ---- T1 / T2 / CE staged exit plan ----
                     # T1 is the app's first resistance / partial scale-out target;
-                    # T2 is the measured-move runner target; CE protects the final
+                    # T2 is the shorter swing runner target; CE protects the final
                     # tranche using the selected stack's Chandelier long stop.
                     t1 = sc.get("target1")
                     t2 = sc.get("target")
                     ce_target = sc.get("ce_stop")
-                    t1_pct = 40 if swp_use_t2 else 100
-                    t2_pct = 60 if swp_use_t2 else 0
+                    t1_pct = SCALE_OUT_T1_PCT if swp_use_t2 else 100
+                    t2_pct = 100 - SCALE_OUT_T1_PCT if swp_use_t2 else 0
                     avg_buy = ((hist or {}).get("avg_buy") or p.get("avg"))
                     # Partition whole shares once so rounding staged tranches can
                     # never recommend more shares than the uploaded position.
@@ -2136,8 +2418,9 @@ with tab_swp:
                 st.caption(
                     f"Targets use the sidebar-selected stack (**{' + '.join(selected_tf)}**) "
                     f"and its primary target timeframe (**{target_tf}**). **T1 sells 100%** "
-                    "when T2 is disabled; when T2 is enabled, it sells **40%** at first "
-                    "resistance and T2 sells the remaining **60%** at the measured-move "
+                    f"when T2 is disabled; when T2 is enabled, it sells **{SCALE_OUT_T1_PCT}%** "
+                    f"at first resistance and T2 sells the remaining **{100 - SCALE_OUT_T1_PCT}%** "
+                    "at the nearer upper-Bollinger or half-ATR runner "
                     "target. When CE is enabled, a stop "
                     "breach before T1 exits the full position; otherwise it protects "
                     "only shares not sold at T1/T2. A red row means its sale condition is met."
@@ -2198,7 +2481,8 @@ with tab_swp:
                         mime="text/csv", key="profit_targets_dl")
                     st.caption(
                         "**T1** sells 100% when T2 is disabled. When T2 is enabled, "
-                        "**T1** sells 40% and **T2** sells the remaining 60%; "
+                        f"**T1** sells {SCALE_OUT_T1_PCT}% and **T2** sells the remaining "
+                        f"{100 - SCALE_OUT_T1_PCT}%; "
                         "when enabled, a **CE stop-loss** sells 100% if breached before "
                         "T1, otherwise only the unsold balance. The uploaded transaction "
                         "history reduces "
@@ -2688,7 +2972,7 @@ with tab_exit:
                         "ST trend": sc.get("st_trend"),
                         "ST reversal": sc.get("st_reversal"),
                         "ST stop (flip)": sc.get("st_flip_price"),
-                        "T1 (scale ~40%)": sc.get("target1"),
+                        f"T1 (scale ~{SCALE_OUT_T1_PCT}%)": sc.get("target1"),
                         "T1 %": sc.get("target1_pct"),
                         "T2 (runner)": sc.get("target"),
                         "Trail stop @": sc.get("stop"),
@@ -2880,9 +3164,9 @@ with tab_exit:
                 "scale-out limit at/above it). **Breakout above** = the price that must "
                 "cross for the breakout to trigger; **Breakout watch** flags a position "
                 f"stale (⌛) if it's still coiling below that trigger after "
-                f"{breakout_patience} days. **T1 (scale ~40%)** = first resistance — "
-                "book ~40% here to lock in a month's worth of gains; **T2 (runner)** = "
-                "full measured-move target for the remainder; **Trail stop @** = exit the "
+                f"{breakout_patience} days. **T1 (scale ~{SCALE_OUT_T1_PCT}%)** = first "
+                "resistance — book the first tranche here; **T2 (runner)** = the nearer "
+                "upper-Bollinger or half-ATR target for the remainder; **Trail stop @** = exit the "
                 "rest if it breaks below. Educational info, not investment advice."
             )
 
@@ -3840,9 +4124,6 @@ with tab_st:
         "smaller anticipatory starter SIP). Set your **investable cash** below each "
         "market — rows are ordered by entry size (largest SIP first)."
     )
-    st_bb_timeframe, st_bb_label = bollinger_entry_timeframe_selector(
-        "st_bollinger_entry_timeframe")
-
     st_combo = ST_STACK_MAP.get(tuple(selected_tf), "1h+2h+4h+1d")
     anchor_tf = ST_COMBOS[st_combo][-1]
     st.info(
@@ -3909,7 +4190,8 @@ with tab_st:
         return styles
 
     st_colcfg = {
-        "_score": None, "_color": None, "_amt": None, "_score_fallback": None,
+        "_score": None, "_macd_score": None, "_macd_status_rank": None,
+        "_color": None, "_amt": None, "_score_fallback": None,
         "Ticker": st.column_config.LinkColumn(
             "Ticker", display_text=r"symbol=(.+)$"),
         "Trend": st.column_config.TextColumn(
@@ -3925,26 +4207,34 @@ with tab_st:
         f"RSI ({anchor_tf})": st.column_config.NumberColumn(
             f"RSI ({anchor_tf})", help=f"Latest 14-period RSI on the Supertrend "
             f"anchor timeframe ({anchor_tf}).", format="%.1f"),
+        f"MACD score ({anchor_tf})": st.column_config.NumberColumn(
+            f"MACD score ({anchor_tf})",
+            help="0-100 MACD confirmation score. Click this numeric column to sort "
+            "the table by the score rather than the confirmation text.",
+            min_value=0, max_value=100, format="%d"),
         f"MACD confirmation ({anchor_tf})": st.column_config.TextColumn(
             f"MACD confirmation ({anchor_tf})",
-            help="0-100 confirmation score. The preceding 8 anchor bars form the "
-            "base: both MACD and signal must stay within 0.35 ATR of zero and within "
-            "0.12 ATR of each other. The current setup is confirmed by a MACD "
-            "up-cross within the latest 3 bars plus a positive, rising histogram."),
-        "BB midpoint entry": st.column_config.NumberColumn(
-            "BB midpoint entry", help="Latest 20-period Bollinger middle band on the "
-            "timeframe selected above; use it as the limit-entry level.",
-            format="%.2f"),
+            help="Confirmation detail. The preceding 8 anchor bars form the base: "
+            "both MACD and signal must stay within 0.35 ATR of zero and within "
+            "0.12 ATR of each other. The setup is confirmed by an up-cross within "
+            "the latest 3 bars plus a positive, rising histogram."),
+        "Preferred buy zone": st.column_config.TextColumn(
+            "Preferred buy zone",
+            help="Normal-pullback limit-buy band: the recent five-day daily support "
+            "low through the nearest valid daily/4-hour EMA20, capped at half a "
+            "daily ATR. 🟢 Within = price is in the band; 🟡 Near = up to half an "
+            "ATR above it; 🔴 Far = more than half an ATR above it; 🔵 Below = "
+            "price is below support."),
         "4% capital": st.column_config.NumberColumn(
             "4% capital", help="Standalone position size: 4% of the total portfolio "
             "capital entered above.", format="%.2f"),
         "Entry units": st.column_config.NumberColumn(
-            "Entry units", help="Whole units purchasable at the selected Bollinger "
-            "midpoint entry "
-            "price, only when cash in hand covers the full 4% allocation.", format="%d"),
+            "Entry units", help="Whole units purchasable at the upper edge of the "
+            "preferred buy zone, only when cash in hand covers the full 4% "
+            "allocation.", format="%d"),
         "Entry instruction": st.column_config.TextColumn(
-            "Entry instruction", help="Place a limit entry at the selected Bollinger "
-            "middle band."),
+            "Entry instruction", help="Place a limit buy within the preferred "
+            "pullback zone."),
         "SIP action": st.column_config.TextColumn(
             "SIP action", help="Entry guidance. Deploy when the setup favours "
             "an uptrend: (a) a BULLISH anchor trend with a LOW reversal score "
@@ -3991,19 +4281,24 @@ with tab_st:
         if caption:
             st.caption(caption)
         gdf = (pd.DataFrame(group_rows)
-               .sort_values("_score", ascending=ascending)
+               .sort_values(
+                   ["_macd_score", "_macd_status_rank", "_score"],
+                   ascending=[False, False, ascending],
+                   na_position="last")
                .reset_index(drop=True))
         styler = gdf.style.apply(_st_row_color, axis=1)
         st.dataframe(styler, use_container_width=True, hide_index=True,
                      column_config=st_colcfg)
         st.download_button(
             "⬇️ Download CSV",
-            gdf.drop(columns=["_score", "_color", "_amt"]).to_csv(index=False).encode(),
+            gdf.drop(columns=[
+                "_score", "_macd_score", "_macd_status_rank", "_color", "_amt",
+            ]).to_csv(index=False).encode(),
             file_name=f"supertrend_reversal_{mkt}_{suffix}_{st_combo.replace('+', '-')}.csv",
             mime="text/csv", key=f"st_dl_{mkt}_{suffix}",
         )
 
-    for mkt in selected_markets:
+    for mkt in scan_markets:
         pool = [s for m, s in results if m == mkt]
         if not pool:
             st.info(f"No {mkt} sectors scanned yet.")
@@ -4031,8 +4326,7 @@ with tab_st:
         if total_capital:
             st.caption(
                 f"**4% entry size:** {sym}{entry_budget:,.2f} per selected position. "
-                f"The table uses the latest {st_bb_label} Bollinger midpoint as the "
-                "entry price; "
+                "The table uses each row's preferred pullback buy zone; "
                 "choose one candidate rather than treating every row as a simultaneous "
                 "4% allocation.")
 
@@ -4045,25 +4339,33 @@ with tab_st:
             da = data.get("dist_atr")
             anchor_rsi = rsi_cached(s.ticker, anchor_tf)
             macd_coil = macd_coil_cached(s.ticker, anchor_tf)
+            macd_status_rank = {
+                "Confirmed up-cross": 4,
+                "Coiling - await cross": 3,
+                "Up-cross - weak base": 2,
+                "No confirmation": 1,
+            }.get(macd_coil.get("status") if macd_coil else None, 0)
             entry = _st_sip_entry(data.get("trend"), score)
             amt = round(cash * entry["pct"] / 100.0)
             performance = supertrend_performance_cached(s.ticker)
-            bb_entry = bollinger_midpoint_cached(s.ticker, st_bb_timeframe)
-            entry_price = bb_entry.get("midpoint") if bb_entry else None
+            buy_zone = preferred_buy_zone_cached(s.ticker)
+            entry_price = buy_zone.get("sizing_price") if buy_zone else None
             entry_units = (
                 int(entry_budget // entry_price)
                 if entry_budget and entry_price and cash >= entry_budget else None)
-            if entry_price is None:
+            if buy_zone is None:
                 entry_instruction = (
-                    f"❔ {st_bb_label} Bollinger midpoint unavailable")
+                    "❔ Preferred buy zone unavailable")
             elif not total_capital:
                 entry_instruction = "Enter total capital"
             elif cash < entry_budget:
                 entry_instruction = "⚠ Cash below required 4%"
             else:
-                entry_instruction = f"📌 Buy-limit at {st_bb_label} BB midpoint"
+                entry_instruction = "📌 Buy-limit within preferred buy zone"
             rows.append({
                 "_score": score if score is not None else -1,
+                "_macd_score": macd_coil.get("score") if macd_coil else -1,
+                "_macd_status_rank": macd_status_rank,
                 "_amt": amt,
                 "_color": _st_color(score),
                 "_score_fallback": data.get("score_fallback", True),
@@ -4071,21 +4373,26 @@ with tab_st:
                 "Symbol": s.ticker,
                 "Sector": s.name,
                 "Trend": data.get("trend"),
+                f"MACD score ({anchor_tf})": (
+                    macd_coil.get("score") if macd_coil else None),
+                f"MACD confirmation ({anchor_tf})": (
+                    macd_coil.get("detail") if macd_coil else "Unavailable"),
+                "Reversal Score": score,
                 "1D change %": (
                     performance.get("daily_change") if performance else None),
                 "1M change %": (
                     performance.get("monthly_change") if performance else None),
                 f"RSI ({anchor_tf})": anchor_rsi,
-                f"MACD confirmation ({anchor_tf})": (
-                    macd_coil.get("display") if macd_coil else "Unavailable"),
-                "BB midpoint entry": entry_price,
+                "Preferred buy zone": (
+                    f"{buy_zone['position']} · {sym}{buy_zone['lower']:,.2f}–"
+                    f"{sym}{buy_zone['upper']:,.2f}"
+                    if buy_zone else "Unavailable"),
                 "4% capital": entry_budget if total_capital else None,
                 "Entry units": entry_units,
                 "Entry instruction": entry_instruction,
                 "SIP action": entry["label"],
                 "SIP %": entry["pct"],
                 "SIP amount": f"{sym}{amt:,.0f}" if entry["pct"] > 0 else "—",
-                "Reversal Score": score,
                 "Score 1w ago": data.get("score_1w"),
                 "Score 2w ago": data.get("score_2w"),
                 "Reversal to": data.get("reversal_to"),
@@ -4134,12 +4441,12 @@ with tab_st:
         # SIP first). Bearish → descending (closest to a bull flip first).
         _render_st_group(
             bull_rows, f"🟢 Bullish trend ({len(bull_rows)})",
-            "Uptrend intact — sorted **ascending** by reversal score: lowest "
-            "reversal risk (strongest SIP) at the top.", True, mkt, "bull")
+            "Uptrend intact — sorted by **MACD confirmation score** (highest first); "
+            "ties use ascending reversal score.", True, mkt, "bull")
         _render_st_group(
             bear_rows, f"🔴 Bearish trend ({len(bear_rows)})",
-            "Downtrend — sorted **descending** by reversal score: closest to a bull "
-            "flip (best reversal SIP) at the top.", False, mkt, "bear")
+            "Downtrend — sorted by **MACD confirmation score** (highest first); "
+            "ties use descending reversal score.", False, mkt, "bear")
 
     st.caption(
         "**How to read it:** a rising score across *Score 2w ago → 1w ago → now* means "
@@ -5015,21 +5322,21 @@ with tab4:
             else:
                 st.caption(mat_msg)
 
-        st.markdown("#### 🎯 Realistic trade plan (measured move)")
+        st.markdown("#### 🎯 Realistic short-swing trade plan")
         t = s.targets
         tcols = st.columns(6)
         tcols[0].metric("Entry", f"{t['entry']:.2f}")
         tcols[1].metric("Breakout level", f"{t['breakout_level']:.2f}")
         tcols[2].metric(
-            f"T1 · scale ~{t.get('scale_out_pct', 40)}%", f"{t['target1']:.2f}",
+            f"T1 · scale ~{t.get('scale_out_pct', SCALE_OUT_T1_PCT)}%", f"{t['target1']:.2f}",
             delta=f"{t['target1_pct']:+.1f}%")
         tcols[3].metric("T2 · runner", f"{t['target']:.2f}", delta=f"{t['upside_pct']:+.1f}%")
         tcols[4].metric("Stop", f"{t['stop']:.2f}", delta=f"{t['downside_pct']:+.1f}%")
         tcols[5].metric("Risk : Reward", f"1 : {t['risk_reward']}" if t['risk_reward'] else "—")
         st.caption(
-            "**T1** = first resistance — book ~40% to lock in a month's worth of gains. "
-            "**T2** = 20-bar resistance + consolidation range height (full measured move) "
-            "for the runner. **Stop** = below the range low (or 1.5×ATR). "
+            f"**T1** = first resistance — book ~{t.get('scale_out_pct', SCALE_OUT_T1_PCT)}% "
+            "there. **T2** = the nearer upper-Bollinger or half-ATR runner, capped by "
+            "the full measured move. **Stop** = below the range low (or 1.5×ATR). "
             "Educational estimate, not advice."
         )
 
@@ -5571,7 +5878,7 @@ if SHOW_SIP_TAB:
                 "≈ Units/day": units_day,
                 "Buy @ (now)": price,
                 "Avg if laddered": avg_ladder,
-                "T1 (scale ~40%)": t.get("target1"),
+                f"T1 (scale ~{SCALE_OUT_T1_PCT}%)": t.get("target1"),
                 "T2 (runner)": t.get("target"),
                 "Stop": t.get("stop"),
                 "_delta": s.breakout_delta,

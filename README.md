@@ -106,6 +106,23 @@ auto-created on first run:
 - Delete a config file to regenerate it from the built-in defaults.
 - You can also add tickers live from the sidebar without editing files.
 
+### Importing a TradingView stock list for Supertrend scanning
+
+In the sidebar, expand **Supertrend stock-list CSV** and either upload a CSV or
+enter its local path. The imported stocks are added to the next **Scan / Refresh**
+without changing the saved ETF lists. TradingView exports with a `TV Code` such
+as `NSE:RELIANCE` are converted automatically to yfinance symbols
+(`RELIANCE.NS`); `BSE`, `NASDAQ`, `NYSE`, and `AMEX` codes are also supported.
+The Supertrend Reversal tab includes the imported market even when it was not
+selected in the ETF market picker.
+
+### Nasdaq-100 stocks near their all-time high
+
+Enable **Nasdaq-100 near ATH** in the sidebar to add Nasdaq-100 components that
+are within 5% of their split-adjusted all-time high to the next scan. The
+component list is fetched from Nasdaq; each qualifying stock is then scored in
+the normal US scanner and appears in the Supertrend Reversal tables.
+
 ## Notes
 - Data comes from **yfinance** (free) and is cached for 15 minutes.
 - Indian tickers use the `.NS` (NSE) suffix.

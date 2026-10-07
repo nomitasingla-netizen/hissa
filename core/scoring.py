@@ -578,16 +578,17 @@ def detect_consolidation(df: pd.DataFrame, interval: str, cap_atr: float = 5.0,
 
 
 # Suggested % of a position to scale out at the interim (T1) target.
-SCALE_OUT_T1_PCT = 40
+SCALE_OUT_T1_PCT = 60
 
 
 def project_targets(df: pd.DataFrame) -> dict:
-    """A realistic measured-move target, stop and risk:reward from consolidation.
+    """A shorter swing target, stop and risk:reward from consolidation.
 
     * breakout level = recent 20-bar high (resistance)
     * measured move  = the consolidation range height (min 2.5*ATR)
     * target1 (T1)   = first resistance — interim scale-out (~monthly cadence)
-    * target  (T2)   = breakout level + measured move — full runner
+    * target  (T2)   = nearer upper-Bollinger / 0.5*ATR runner, capped by
+                        the full measured move
     * stop           = min(range low, price - 1.5*ATR)
     """
     if df is None or df.empty or len(df) < 25:
@@ -603,8 +604,7 @@ def project_targets(df: pd.DataFrame) -> dict:
     range_high = float(high.tail(20).max())
     range_low = float(low.tail(20).min())
     measured = max(range_high - range_low, 2.5 * atr_v)
-
-    target = range_high + measured          # full measured-move (T2 / runner)
+    full_measured_target = range_high + measured
     stop = min(range_low, price - 1.5 * atr_v)
 
     # Interim first target (T1) for a partial scale-out. First resistance is the
@@ -613,9 +613,19 @@ def project_targets(df: pd.DataFrame) -> dict:
     if price < range_high:
         target1 = range_high
     else:
-        target1 = price + 0.5 * (target - price)
+        target1 = price + 0.5 * (full_measured_target - price)
     target1 = max(target1, price * 1.01)    # keep it meaningfully above price
-    target1 = min(target1, target)          # never above the full target
+    target1 = min(target1, full_measured_target)
+
+    # Keep the runner achievable for a normal swing rather than requiring the
+    # full consolidation measured move. Prefer the nearest upper Bollinger
+    # resistance when it is above T1; otherwise use a half-ATR extension.
+    _, bb_upper, _, _ = ind.bollinger(close)
+    bb_upper_v = float(bb_upper.iloc[-1])
+    short_runner = target1 + 0.5 * atr_v
+    if not math.isnan(bb_upper_v) and bb_upper_v > target1:
+        short_runner = min(short_runner, bb_upper_v)
+    target = min(full_measured_target, short_runner)
 
     upside_pct = (target / price - 1) * 100
     target1_pct = (target1 / price - 1) * 100

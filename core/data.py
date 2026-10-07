@@ -198,6 +198,49 @@ def fetch_daily_ohlcv(ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def fetch_all_time_highs(tickers: list[str]) -> dict[str, dict[str, float]]:
+    """Return split-adjusted all-time-high statistics for a ticker batch."""
+    symbols = list(dict.fromkeys(
+        str(ticker).strip().upper() for ticker in tickers if str(ticker).strip()
+    ))
+    if not symbols:
+        return {}
+    try:
+        data = yf.download(
+            tickers=symbols, period="max", interval="1d", auto_adjust=True,
+            progress=False, threads=True, group_by="ticker",
+        )
+    except Exception:
+        return {}
+    if data.empty:
+        return {}
+
+    results: dict[str, dict[str, float]] = {}
+    for ticker in symbols:
+        if len(symbols) == 1:
+            frame = _drop_incomplete(_flatten(data.copy()))
+        elif isinstance(data.columns, pd.MultiIndex) and ticker in data.columns.get_level_values(0):
+            frame = _drop_incomplete(data[ticker].copy())
+        else:
+            continue
+        if frame.empty or not {"High", "Close"}.issubset(frame.columns):
+            continue
+        high = frame["High"].astype(float).dropna()
+        close = frame["Close"].astype(float).dropna()
+        if high.empty or close.empty:
+            continue
+        all_time_high = float(high.max())
+        price = float(close.iloc[-1])
+        if all_time_high <= 0:
+            continue
+        results[ticker] = {
+            "all_time_high": all_time_high,
+            "price": price,
+            "pct_from_ath": (price / all_time_high - 1) * 100,
+        }
+    return results
+
+
 def fetch_30m_ohlcv(ticker: str) -> pd.DataFrame:
     """Fetch 30-minute OHLCV for short-term Bollinger entry levels."""
     try:
