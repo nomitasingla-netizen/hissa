@@ -145,6 +145,19 @@ def parse_tradingview_stock_csv(csv_text: str) -> tuple[dict[str, dict[str, str]
 
 
 NASDAQ_NDX_WEIGHTING_URL = "https://indexes.nasdaqomx.com/Index/WeightingData"
+NIFTY100_CONSTITUENT_URLS = (
+    "https://www.niftyindices.com/IndexConstituent/ind_nifty50list.csv",
+    "https://www.niftyindices.com/IndexConstituent/ind_niftynext50list.csv",
+)
+NIFTY_MIDCAP150_CONSTITUENT_URLS = (
+    "https://www.niftyindices.com/IndexConstituent/ind_niftymidcap150list.csv",
+)
+NIFTY_SMALLCAP250_CONSTITUENT_URLS = (
+    "https://www.niftyindices.com/IndexConstituent/ind_niftysmallcap250list.csv",
+)
+NIFTY500_CONSTITUENT_URLS = (
+    "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv",
+)
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -219,6 +232,115 @@ def nasdaq100_near_ath_cached(threshold_pct: float) -> dict:
         "as_of": constituent_data.get("as_of"),
         "error": "",
     }
+
+
+def _fetch_nifty_constituents(urls: tuple[str, ...]) -> dict:
+    """Fetch one or more Nifty constituent CSVs as yfinance NSE symbols."""
+    members: dict[str, str] = {}
+    errors = []
+    for url in urls:
+        request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urlopen(request, timeout=30) as response:
+                text = response.read().decode("utf-8-sig")
+            constituents = pd.read_csv(StringIO(text), dtype=str)
+        except (OSError, TimeoutError, UnicodeDecodeError,
+                pd.errors.EmptyDataError, pd.errors.ParserError) as exc:
+            errors.append(str(exc))
+            continue
+        if not {"Symbol", "Company Name"}.issubset(constituents.columns):
+            errors.append(f"Unexpected constituent CSV format at {url}.")
+            continue
+        for _, row in constituents.iterrows():
+            symbol = str(row.get("Symbol", "") or "").strip().upper()
+            if not symbol or symbol == "NAN":
+                continue
+            company = str(row.get("Company Name", "") or "").strip()
+            industry = str(row.get("Industry", "") or "").strip()
+            name = company if company and company != "nan" else symbol
+            if industry and industry != "nan":
+                name = f"{name} · {industry}"
+            members[f"{symbol}.NS"] = name
+
+    return {
+        "members": members,
+        "error": "; ".join(errors) if not members else "",
+    }
+
+
+def _nifty_near_ath(constituent_data: dict, index_name: str,
+                    threshold_pct: float) -> dict:
+    """Filter Nifty index constituents to stocks no more than ``threshold_pct`` below ATH."""
+    members = constituent_data.get("members") or {}
+    if not members:
+        return {
+            "stocks": {},
+            "error": constituent_data.get("error") or f"{index_name} list unavailable.",
+        }
+
+    ath_data = fetch_all_time_highs(list(members))
+    qualifying = {}
+    for ticker, stats in ath_data.items():
+        pct_from_ath = stats.get("pct_from_ath")
+        if pct_from_ath is None or pct_from_ath < -threshold_pct:
+            continue
+        name = members.get(ticker) or ticker
+        qualifying[ticker] = (
+            f"{name} · {index_name} near ATH ({pct_from_ath:.1f}% from ATH)"
+        )
+    return {"stocks": qualifying, "error": ""}
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def nifty100_constituents_cached() -> dict:
+    """Fetch and combine the Nifty 50 and Nifty Next 50 constituent lists."""
+    return _fetch_nifty_constituents(NIFTY100_CONSTITUENT_URLS)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def nifty_midcap150_constituents_cached() -> dict:
+    """Fetch the Nifty Midcap 150 constituent list."""
+    return _fetch_nifty_constituents(NIFTY_MIDCAP150_CONSTITUENT_URLS)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def nifty_smallcap250_constituents_cached() -> dict:
+    """Fetch the Nifty Smallcap 250 constituent list."""
+    return _fetch_nifty_constituents(NIFTY_SMALLCAP250_CONSTITUENT_URLS)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def nifty500_constituents_cached() -> dict:
+    """Fetch the Nifty 500 constituent list."""
+    return _fetch_nifty_constituents(NIFTY500_CONSTITUENT_URLS)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def nifty100_near_ath_cached(threshold_pct: float) -> dict:
+    """Return Nifty 100 stocks trading no more than ``threshold_pct`` below ATH."""
+    return _nifty_near_ath(
+        nifty100_constituents_cached(), "Nifty 100", threshold_pct)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def nifty_midcap150_near_ath_cached(threshold_pct: float) -> dict:
+    """Return Nifty Midcap 150 stocks trading no more than ``threshold_pct`` below ATH."""
+    return _nifty_near_ath(
+        nifty_midcap150_constituents_cached(), "Nifty Midcap 150", threshold_pct)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def nifty_smallcap250_near_ath_cached(threshold_pct: float) -> dict:
+    """Return Nifty Smallcap 250 stocks trading no more than ``threshold_pct`` below ATH."""
+    return _nifty_near_ath(
+        nifty_smallcap250_constituents_cached(), "Nifty Smallcap 250", threshold_pct)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def nifty500_near_ath_cached(threshold_pct: float) -> dict:
+    """Return Nifty 500 stocks trading no more than ``threshold_pct`` below ATH."""
+    return _nifty_near_ath(
+        nifty500_constituents_cached(), "Nifty 500", threshold_pct)
 
 
 ETF_BUY_DATA_PATHS = {
@@ -762,22 +884,36 @@ for message in stock_csv_messages:
     st.sidebar.warning(message)
 
 st.sidebar.markdown("---")
+ath_threshold_pct = st.sidebar.number_input(
+    "ATH proximity (%)",
+    min_value=0.5,
+    max_value=30.0,
+    value=7.0,
+    step=0.5,
+    key="ath_threshold_pct",
+    help="Include a stock when it is no more than this percentage below its "
+    "split-adjusted all-time high. This threshold applies to every Nasdaq and "
+    "Nifty near-ATH scanner below.",
+)
 st.sidebar.subheader("🏔️ Nasdaq-100 near ATH")
 include_nasdaq100_near_ath = st.sidebar.checkbox(
-    "Add Nasdaq-100 stocks within 5% of ATH",
+    f"Add Nasdaq-100 stocks within {ath_threshold_pct:g}% of ATH",
     value=False,
-    help="Fetches current Nasdaq-100 components and adds only stocks trading no "
-    "more than 5% below their split-adjusted all-time high to the next scan.",
+    key="include_nasdaq100_near_ath",
+    help="Fetches current Nasdaq-100 components and adds only stocks within the "
+    "configured ATH proximity to the next scan.",
 )
 if include_nasdaq100_near_ath:
-    nasdaq_near_ath = nasdaq100_near_ath_cached(5.0)
+    nasdaq_near_ath = nasdaq100_near_ath_cached(float(ath_threshold_pct))
     nasdaq_stocks = nasdaq_near_ath.get("stocks") or {}
     if nasdaq_near_ath.get("error"):
         st.sidebar.error(
             f"Could not load Nasdaq-100 near-ATH stocks: {nasdaq_near_ath['error']}"
         )
     elif not nasdaq_stocks:
-        st.sidebar.info("No Nasdaq-100 stocks are currently within 5% of ATH.")
+        st.sidebar.info(
+            f"No Nasdaq-100 stocks are currently within {ath_threshold_pct:g}% of ATH."
+        )
     else:
         us_list = custom_lists.setdefault("US", {})
         additions = {
@@ -790,6 +926,143 @@ if include_nasdaq100_near_ath:
         st.sidebar.success(
             f"Loaded {len(additions)} Nasdaq-100 near-ATH stock(s) "
             f"(components as of {nasdaq_near_ath.get('as_of')}). Click Scan / Refresh."
+        )
+
+st.sidebar.subheader("🏔️ Nifty 100 near ATH")
+include_nifty100_near_ath = st.sidebar.checkbox(
+    f"Add Nifty 100 stocks within {ath_threshold_pct:g}% of ATH",
+    value=False,
+    key="include_nifty100_near_ath",
+    help="Combines Nifty 50 and Nifty Next 50 constituents, then adds only stocks "
+    "within the configured ATH proximity to the next scan.",
+)
+if include_nifty100_near_ath:
+    nifty_near_ath = nifty100_near_ath_cached(float(ath_threshold_pct))
+    nifty_stocks = nifty_near_ath.get("stocks") or {}
+    if nifty_near_ath.get("error"):
+        st.sidebar.error(
+            f"Could not load Nifty 100 near-ATH stocks: {nifty_near_ath['error']}"
+        )
+    elif not nifty_stocks:
+        st.sidebar.info(
+            f"No Nifty 100 stocks are currently within {ath_threshold_pct:g}% of ATH."
+        )
+    else:
+        india_list = custom_lists.setdefault("India", {})
+        additions = {
+            ticker: name for ticker, name in nifty_stocks.items()
+            if ticker not in india_list
+        }
+        india_list.update(additions)
+        if "India" not in scan_markets:
+            scan_markets.append("India")
+        st.sidebar.success(
+            f"Loaded {len(additions)} Nifty 100 near-ATH stock(s) "
+            "(Nifty 50 + Nifty Next 50). Click Scan / Refresh."
+        )
+
+st.sidebar.subheader("🏔️ Nifty Midcap 150 near ATH")
+include_nifty_midcap150_near_ath = st.sidebar.checkbox(
+    f"Add Nifty Midcap 150 stocks within {ath_threshold_pct:g}% of ATH",
+    value=False,
+    key="include_nifty_midcap150_near_ath",
+    help="Adds only Nifty Midcap 150 stocks within the configured ATH proximity "
+    "to the next India scan.",
+)
+if include_nifty_midcap150_near_ath:
+    midcap_near_ath = nifty_midcap150_near_ath_cached(float(ath_threshold_pct))
+    midcap_stocks = midcap_near_ath.get("stocks") or {}
+    if midcap_near_ath.get("error"):
+        st.sidebar.error(
+            "Could not load Nifty Midcap 150 near-ATH stocks: "
+            f"{midcap_near_ath['error']}"
+        )
+    elif not midcap_stocks:
+        st.sidebar.info(
+            f"No Nifty Midcap 150 stocks are currently within {ath_threshold_pct:g}% "
+            "of ATH."
+        )
+    else:
+        india_list = custom_lists.setdefault("India", {})
+        additions = {
+            ticker: name for ticker, name in midcap_stocks.items()
+            if ticker not in india_list
+        }
+        india_list.update(additions)
+        if "India" not in scan_markets:
+            scan_markets.append("India")
+        st.sidebar.success(
+            f"Loaded {len(additions)} Nifty Midcap 150 near-ATH stock(s). "
+            "Click Scan / Refresh."
+        )
+
+st.sidebar.subheader("🏔️ Nifty Smallcap 250 near ATH")
+include_nifty_smallcap250_near_ath = st.sidebar.checkbox(
+    f"Add Nifty Smallcap 250 stocks within {ath_threshold_pct:g}% of ATH",
+    value=False,
+    key="include_nifty_smallcap250_near_ath",
+    help="Adds only Nifty Smallcap 250 stocks within the configured ATH proximity "
+    "to the next India scan.",
+)
+if include_nifty_smallcap250_near_ath:
+    smallcap_near_ath = nifty_smallcap250_near_ath_cached(float(ath_threshold_pct))
+    smallcap_stocks = smallcap_near_ath.get("stocks") or {}
+    if smallcap_near_ath.get("error"):
+        st.sidebar.error(
+            "Could not load Nifty Smallcap 250 near-ATH stocks: "
+            f"{smallcap_near_ath['error']}"
+        )
+    elif not smallcap_stocks:
+        st.sidebar.info(
+            f"No Nifty Smallcap 250 stocks are currently within {ath_threshold_pct:g}% "
+            "of ATH."
+        )
+    else:
+        india_list = custom_lists.setdefault("India", {})
+        additions = {
+            ticker: name for ticker, name in smallcap_stocks.items()
+            if ticker not in india_list
+        }
+        india_list.update(additions)
+        if "India" not in scan_markets:
+            scan_markets.append("India")
+        st.sidebar.success(
+            f"Loaded {len(additions)} Nifty Smallcap 250 near-ATH stock(s). "
+            "Click Scan / Refresh."
+        )
+
+st.sidebar.subheader("🏔️ Nifty 500 near ATH")
+include_nifty500_near_ath = st.sidebar.checkbox(
+    f"Add Nifty 500 stocks within {ath_threshold_pct:g}% of ATH",
+    value=False,
+    key="include_nifty500_near_ath",
+    help="Adds only Nifty 500 stocks within the configured ATH proximity to the "
+    "next India scan. Fetching all-time-high data for this 500-stock universe "
+    "can take longer than the smaller index screens.",
+)
+if include_nifty500_near_ath:
+    nifty500_near_ath = nifty500_near_ath_cached(float(ath_threshold_pct))
+    nifty500_stocks = nifty500_near_ath.get("stocks") or {}
+    if nifty500_near_ath.get("error"):
+        st.sidebar.error(
+            f"Could not load Nifty 500 near-ATH stocks: {nifty500_near_ath['error']}"
+        )
+    elif not nifty500_stocks:
+        st.sidebar.info(
+            f"No Nifty 500 stocks are currently within {ath_threshold_pct:g}% of ATH."
+        )
+    else:
+        india_list = custom_lists.setdefault("India", {})
+        additions = {
+            ticker: name for ticker, name in nifty500_stocks.items()
+            if ticker not in india_list
+        }
+        india_list.update(additions)
+        if "India" not in scan_markets:
+            scan_markets.append("India")
+        st.sidebar.success(
+            f"Loaded {len(additions)} Nifty 500 near-ATH stock(s). "
+            "Click Scan / Refresh."
         )
 
 st.sidebar.markdown("---")

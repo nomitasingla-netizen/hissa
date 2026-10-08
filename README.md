@@ -119,9 +119,29 @@ selected in the ETF market picker.
 ### Nasdaq-100 stocks near their all-time high
 
 Enable **Nasdaq-100 near ATH** in the sidebar to add Nasdaq-100 components that
-are within 5% of their split-adjusted all-time high to the next scan. The
+are within the configured proximity of their split-adjusted all-time high to
+the next scan. The shared **ATH proximity (%)** setting defaults to 7%. The
 component list is fetched from Nasdaq; each qualifying stock is then scored in
 the normal US scanner and appears in the Supertrend Reversal tables.
+
+### Nifty 100 stocks near their all-time high
+
+Enable **Nifty 100 near ATH** to combine the Nifty 50 and Nifty Next 50
+constituent lists, identify stocks within the shared ATH proximity of their
+split-adjusted all-time high, and add those names to the next India scan.
+
+### Nifty Midcap and Smallcap stocks near their all-time high
+
+Use **Nifty Midcap 150 near ATH** or **Nifty Smallcap 250 near ATH** to add
+qualifying names from either index to the next India scan. Both use the shared
+split-adjusted all-time-high threshold configured with **ATH proximity (%)**
+and can be enabled alongside Nifty 100.
+
+### Nifty 500 stocks near their all-time high
+
+Enable **Nifty 500 near ATH** to screen the full Nifty 500 constituent list
+against the shared ATH proximity threshold and add qualifying names to the next
+India scan. This broader all-time-high screen can take longer to refresh.
 
 ## Notes
 - Data comes from **yfinance** (free) and is cached for 15 minutes.
