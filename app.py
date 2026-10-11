@@ -8,6 +8,7 @@ import math
 import os
 import re
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
 from pathlib import Path
 from urllib.parse import urlencode
@@ -1106,9 +1107,38 @@ run = st.sidebar.button("🔄 Scan / Refresh", type="primary", use_container_wid
 
 
 # ----------------------------- Scan logic -----------------------------
+SCAN_MAX_WORKERS = 8
+
+
+def _score_scan_task(index: int, market: str, ticker: str, name: str,
+                     bench_frames: dict, timeframes: tuple, as_of=None) -> tuple:
+    """Fetch and score one ticker without touching Streamlit UI state."""
+    try:
+        frames = truncate_frames(load_frames(ticker), as_of)
+        score = score_sector(ticker, name, frames, bench_frames, timeframes)
+        score.breakout_1w_ago = breakout_snapshot(
+            ticker, name, frames, bench_frames, timeframes, "1w")
+        score.breakout_2w_ago = breakout_snapshot(
+            ticker, name, frames, bench_frames, timeframes, "2w")
+        score.imminence_1w_ago = imminence_snapshot(
+            ticker, name, frames, bench_frames, timeframes, "1w")
+        score.st_mtf = mtf_supertrend_all(frames)
+        for st_data in score.st_mtf.values():
+            if not st_data:
+                continue
+            anchor_frame = frames.get(st_data.get("anchor"), pd.DataFrame())
+            st_data["score_fallback"] = not bool(
+                anchor_frame.attrs.get("is_current_session"))
+            st_data["score_as_of"] = (
+                pd.Timestamp(anchor_frame.index[-1]).strftime("%Y-%m-%d")
+                if not anchor_frame.empty else None)
+        return index, market, score, None
+    except Exception as exc:
+        return index, market, None, f"Failed to score {ticker}: {exc}"
+
+
 def run_scan(markets: list[str], lists: dict[str, dict], timeframes: tuple,
              as_of=None) -> list:
-    results = []
     tasks = []
     for mkt in markets:
         for ticker, name in lists[mkt].items():
@@ -1116,40 +1146,42 @@ def run_scan(markets: list[str], lists: dict[str, dict], timeframes: tuple,
 
     bench_cache: dict[str, dict] = {}
     progress = st.progress(0.0, text="Starting scan…")
-    total = len(tasks)
-
-    for i, (mkt, ticker, name) in enumerate(tasks, start=1):
+    total = max(1, len(tasks))
+    for mkt in markets:
         bench_ticker = MARKETS[mkt]["benchmark"]
         if bench_ticker not in bench_cache:
             bench_cache[bench_ticker] = truncate_frames(load_frames(bench_ticker), as_of)
-        bench_frames = bench_cache[bench_ticker]
 
-        progress.progress(i / total, text=f"Scanning {ticker} — {name} ({i}/{total})")
-        frames = truncate_frames(load_frames(ticker), as_of)
-        try:
-            score = score_sector(ticker, name, frames, bench_frames, timeframes)
-            score.breakout_1w_ago = breakout_snapshot(
-                ticker, name, frames, bench_frames, timeframes, "1w")
-            score.breakout_2w_ago = breakout_snapshot(
-                ticker, name, frames, bench_frames, timeframes, "2w")
-            score.imminence_1w_ago = imminence_snapshot(
-                ticker, name, frames, bench_frames, timeframes, "1w")
-            score.st_mtf = mtf_supertrend_all(frames)
-            for st_data in score.st_mtf.values():
-                if not st_data:
-                    continue
-                anchor_frame = frames.get(st_data.get("anchor"), pd.DataFrame())
-                st_data["score_fallback"] = not bool(
-                    anchor_frame.attrs.get("is_current_session"))
-                st_data["score_as_of"] = (
-                    pd.Timestamp(anchor_frame.index[-1]).strftime("%Y-%m-%d")
-                    if not anchor_frame.empty else None)
-            results.append((mkt, score))
-        except Exception as exc:  # keep scanning even if one ticker fails
-            st.warning(f"Failed to score {ticker}: {exc}")
+    completed = 0
+    scored: dict[int, tuple] = {}
+    failures = []
+    worker_count = min(SCAN_MAX_WORKERS, len(tasks))
+    if worker_count:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    _score_scan_task, index, market, ticker, name,
+                    bench_cache[MARKETS[market]["benchmark"]], timeframes, as_of,
+                ): (ticker, name)
+                for index, (market, ticker, name) in enumerate(tasks)
+            }
+            for future in as_completed(futures):
+                ticker, name = futures[future]
+                index, market, score, error = future.result()
+                completed += 1
+                progress.progress(
+                    completed / total,
+                    text=f"Scanned {ticker} — {name} ({completed}/{len(tasks)})",
+                )
+                if error:
+                    failures.append(error)
+                elif score is not None:
+                    scored[index] = (market, score)
 
     progress.empty()
-    return results
+    for failure in failures:
+        st.warning(failure)
+    return [scored[index] for index in sorted(scored)]
 
 
 def run_retest_scan(markets: list[str], min_conf: float) -> list[dict]:

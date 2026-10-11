@@ -14,6 +14,7 @@ _ENTRY_INTRADAY_PERIOD = "60d"
 _DAILY_PERIOD = "2y"
 # Weekly uses a long window so the 200-week moving average has enough history.
 _WEEKLY_PERIOD = "10y"
+_ATH_BATCH_SIZE = 100
 
 
 def _flatten(df: pd.DataFrame) -> pd.DataFrame:
@@ -62,6 +63,15 @@ def _latest_session_date(df: pd.DataFrame):
     if stamp.tzinfo is not None:
         stamp = stamp.tz_localize(None)
     return stamp.normalize()
+
+
+def _week_start(stamp) -> pd.Timestamp:
+    """Return the Monday that starts the week containing ``stamp`` (tz-naive)."""
+    stamp = pd.Timestamp(stamp)
+    if stamp.tzinfo is not None:
+        stamp = stamp.tz_localize(None)
+    stamp = stamp.normalize()
+    return stamp - pd.Timedelta(days=stamp.weekday())
 
 
 def _refresh_intraday_quote(hourly: pd.DataFrame, quote: dict) -> pd.DataFrame:
@@ -177,8 +187,18 @@ def fetch_ohlcv(ticker: str) -> dict[str, pd.DataFrame]:
         if not weekly.empty:
             quote_price = quote.get("last_price")
             weekly_close = float(weekly["Close"].iloc[-1])
-            weekly.attrs["is_current_session"] = bool(
-                quote_price and abs(weekly_close / quote_price - 1) < 0.002)
+            if quote_price:
+                is_current = abs(weekly_close / quote_price - 1) < 0.002
+            else:
+                # No quote: the weekly bar is current only when the daily bar is
+                # the current session and falls in the same week.
+                daily_frame = result["1d"]
+                is_current = (
+                    not daily_frame.empty
+                    and bool(daily_frame.attrs.get("is_current_session"))
+                    and _week_start(weekly.index[-1]) == _week_start(daily_frame.index[-1])
+                )
+            weekly.attrs["is_current_session"] = bool(is_current)
         result["1wk"] = weekly
     except Exception:
         pass
@@ -199,45 +219,49 @@ def fetch_daily_ohlcv(ticker: str) -> pd.DataFrame:
 
 
 def fetch_all_time_highs(tickers: list[str]) -> dict[str, dict[str, float]]:
-    """Return split-adjusted all-time-high statistics for a ticker batch."""
+    """Return split-adjusted all-time-high statistics in bounded ticker batches."""
     symbols = list(dict.fromkeys(
         str(ticker).strip().upper() for ticker in tickers if str(ticker).strip()
     ))
     if not symbols:
         return {}
-    try:
-        data = yf.download(
-            tickers=symbols, period="max", interval="1d", auto_adjust=True,
-            progress=False, threads=True, group_by="ticker",
-        )
-    except Exception:
-        return {}
-    if data.empty:
-        return {}
 
     results: dict[str, dict[str, float]] = {}
-    for ticker in symbols:
-        if len(symbols) == 1:
-            frame = _drop_incomplete(_flatten(data.copy()))
-        elif isinstance(data.columns, pd.MultiIndex) and ticker in data.columns.get_level_values(0):
-            frame = _drop_incomplete(data[ticker].copy())
-        else:
+    for start in range(0, len(symbols), _ATH_BATCH_SIZE):
+        batch = symbols[start:start + _ATH_BATCH_SIZE]
+        try:
+            data = yf.download(
+                tickers=batch, period="max", interval="1d", auto_adjust=True,
+                progress=False, threads=True, group_by="ticker",
+            )
+        except Exception:
             continue
-        if frame.empty or not {"High", "Close"}.issubset(frame.columns):
+        if data.empty:
             continue
-        high = frame["High"].astype(float).dropna()
-        close = frame["Close"].astype(float).dropna()
-        if high.empty or close.empty:
-            continue
-        all_time_high = float(high.max())
-        price = float(close.iloc[-1])
-        if all_time_high <= 0:
-            continue
-        results[ticker] = {
-            "all_time_high": all_time_high,
-            "price": price,
-            "pct_from_ath": (price / all_time_high - 1) * 100,
-        }
+
+        for ticker in batch:
+            if len(batch) == 1:
+                frame = _drop_incomplete(_flatten(data.copy()))
+            elif (isinstance(data.columns, pd.MultiIndex)
+                  and ticker in data.columns.get_level_values(0)):
+                frame = _drop_incomplete(data[ticker].copy())
+            else:
+                continue
+            if frame.empty or not {"High", "Close"}.issubset(frame.columns):
+                continue
+            high = frame["High"].astype(float).dropna()
+            close = frame["Close"].astype(float).dropna()
+            if high.empty or close.empty:
+                continue
+            all_time_high = float(high.max())
+            price = float(close.iloc[-1])
+            if all_time_high <= 0:
+                continue
+            results[ticker] = {
+                "all_time_high": all_time_high,
+                "price": price,
+                "pct_from_ath": (price / all_time_high - 1) * 100,
+            }
     return results
 
 

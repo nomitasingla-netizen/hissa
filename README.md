@@ -145,6 +145,8 @@ India scan. This broader all-time-high screen can take longer to refresh.
 
 ## Notes
 - Data comes from **yfinance** (free) and is cached for 15 minutes.
+- Scans use up to eight concurrent ticker workers. Large all-time-high index
+  screens use bounded download batches to keep requests reliable.
 - Indian tickers use the `.NS` (NSE) suffix.
 - **Not investment advice** — a decision-support tool. Always confirm with your
   own analysis and risk management.
