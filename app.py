@@ -595,6 +595,105 @@ def macd_coil_cached(ticker: str, timeframe: str) -> dict | None:
     }
 
 
+MACD_REVERSAL_STATUS_RANK = {
+    "Reversal up-cross confirmed": 4,
+    "Histogram turning - await cross": 3,
+    "Up-cross - momentum fading": 2,
+    "Up-cross aged over 10 bars": 2,
+    "No reversal confirmation": 1,
+}
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def macd_reversal_cached(ticker: str, timeframe: str,
+                         lower_timeframe: str | None) -> dict | None:
+    """Score a MACD up-cross as confirmation of a bearish-trend reversal.
+
+    Unlike the near-zero coil score, a cross well below zero is not penalised:
+    after a downtrend MACD is normally negative, and a bullish cross below the
+    zero line is the classic early reversal signal. Points: MACD above its signal
+    after an up-cross within the latest 3 bars (35) or 11 bars (25), histogram
+    positive and rising (20, or 10 for one of the two), histogram rising for 3+ bars (15), lower-timeframe MACD above its
+    signal (15) and the cross happening below zero (15).
+    """
+    frame = load_frames(ticker).get(timeframe, pd.DataFrame())
+    if frame.empty or len(frame) < 36 or "Close" not in frame.columns:
+        return None
+
+    close = frame["Close"].astype(float)
+    macd_line, signal_line, histogram = ind.macd(close)
+    values = pd.DataFrame({
+        "macd": macd_line, "signal": signal_line, "histogram": histogram,
+    }).dropna()
+    if len(values) < 10:
+        return None
+
+    # Bars since MACD last crossed above its signal, while it is still above.
+    above = values["macd"] > values["signal"]
+    cross_age = None
+    if above.iloc[-1]:
+        below_positions = [i for i, flag in enumerate(above) if not flag]
+        if below_positions:
+            cross_age = len(above) - 1 - (below_positions[-1] + 1)
+    recent_cross_up = cross_age is not None and cross_age <= 10
+    cross_below_zero = bool(
+        recent_cross_up and values["macd"].iloc[-1 - cross_age] < 0)
+
+    hist = values["histogram"]
+    histogram_positive = hist.iloc[-1] > 0
+    histogram_rising = hist.iloc[-1] > hist.iloc[-2]
+    rising_bars = 0
+    for i in range(len(hist) - 1, 0, -1):
+        if hist.iloc[i] <= hist.iloc[i - 1] or rising_bars >= 9:
+            break
+        rising_bars += 1
+
+    lower_above_signal = None
+    if lower_timeframe:
+        lower = load_frames(ticker).get(lower_timeframe, pd.DataFrame())
+        if not lower.empty and len(lower) >= 36 and "Close" in lower.columns:
+            lower_macd, lower_signal, _ = ind.macd(lower["Close"].astype(float))
+            if not (pd.isna(lower_macd.iloc[-1]) or pd.isna(lower_signal.iloc[-1])):
+                lower_above_signal = bool(lower_macd.iloc[-1] > lower_signal.iloc[-1])
+
+    score = (
+        (35 if recent_cross_up and cross_age <= 2 else 25 if recent_cross_up else 0)
+        + (20 if histogram_positive and histogram_rising else (
+            10 if histogram_positive or histogram_rising else 0))
+        + (15 if rising_bars >= 3 else 0)
+        + (15 if lower_above_signal else 0)
+        + (15 if cross_below_zero else 0)
+    )
+
+    if recent_cross_up and histogram_positive and histogram_rising:
+        status = "Reversal up-cross confirmed"
+    elif recent_cross_up:
+        status = "Up-cross - momentum fading"
+    elif cross_age is not None:
+        status = "Up-cross aged over 10 bars"
+    elif not histogram_positive and rising_bars >= 2:
+        status = "Histogram turning - await cross"
+    else:
+        status = "No reversal confirmation"
+
+    zero_side = "Below 0" if values["macd"].iloc[-1] < 0 else "Above 0"
+    if lower_above_signal is None:
+        lower_text = f"{lower_timeframe} MACD n/a" if lower_timeframe else "No lower TF"
+    else:
+        lower_text = (f"{lower_timeframe} MACD "
+                      f"{'above' if lower_above_signal else 'below'} signal")
+    cross_text = (f"Crossed {cross_age} bars ago" if cross_age
+                  else "Crossed this bar" if cross_age == 0 else "No up-cross")
+    detail = (f"{status} | {zero_side} | {cross_text} | Hist up {rising_bars} bars "
+              f"| {lower_text}")
+    return {
+        "score": score,
+        "status": status,
+        "detail": detail,
+        "display": f"{score} | {detail}",
+    }
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def etf_bottom_confirmation_cached(ticker: str, tfs: tuple) -> dict | None:
     """Return the bottoming checks used before averaging a bearish ETF."""
@@ -1252,6 +1351,7 @@ if run:
         bollinger_midpoint_cached.clear()
         rsi_cached.clear()
         macd_coil_cached.clear()
+        macd_reversal_cached.clear()
     st.session_state["results"] = run_scan(scan_markets, custom_lists, selected_tf, as_of_date)
 
 results = st.session_state.get("results", [])
@@ -4431,6 +4531,7 @@ with tab_st:
     )
     st_combo = ST_STACK_MAP.get(tuple(selected_tf), "1h+2h+4h+1d")
     anchor_tf = ST_COMBOS[st_combo][-1]
+    lower_tf = ST_COMBOS[st_combo][-2] if len(ST_COMBOS[st_combo]) > 1 else None
     st.info(
         f"⏱️ Timeframe stack **{st_combo}** — set it from the sidebar **Timeframe** "
         f"control (pick an **MTF …** option). Predicting a reversal of the "
@@ -4578,7 +4679,29 @@ with tab_st:
             "across this price flips the anchor trend.", format="%.2f"),
     }
 
-    def _render_st_group(group_rows, title, caption, ascending, mkt, suffix):
+    # Bearish rows score MACD as reversal confirmation, so their help differs.
+    st_bear_colcfg = {
+        **st_colcfg,
+        f"MACD score ({anchor_tf})": st.column_config.NumberColumn(
+            f"MACD score ({anchor_tf})",
+            help="0-100 MACD reversal-confirmation score for a bearish anchor: "
+            "MACD above signal after an up-cross within the latest 3 bars (35) or "
+            "11 bars (25), histogram positive and rising "
+            "(20; 10 for one of the two), histogram rising 3+ bars (15), "
+            f"{lower_tf or 'lower-timeframe'} MACD above its signal (15), and the "
+            "cross happening below zero (15). Click to sort by the score.",
+            min_value=0, max_value=100, format="%d"),
+        f"MACD confirmation ({anchor_tf})": st.column_config.TextColumn(
+            f"MACD confirmation ({anchor_tf})",
+            help="Reversal detail. A bullish cross below the zero line is the early "
+            "sign a downtrend is ending, so distance below zero is not penalised. "
+            "Treat it as confirmation of the reversal score, not a trigger on its "
+            "own: the anchor Supertrend has not flipped until a close crosses the "
+            "Flip price."),
+    }
+
+    def _render_st_group(group_rows, title, caption, ascending, mkt, suffix,
+                         colcfg=st_colcfg):
         st.markdown(f"#### {title}")
         if not group_rows:
             st.caption("_None in this group right now._")
@@ -4593,7 +4716,7 @@ with tab_st:
                .reset_index(drop=True))
         styler = gdf.style.apply(_st_row_color, axis=1)
         st.dataframe(styler, use_container_width=True, hide_index=True,
-                     column_config=st_colcfg)
+                     column_config=colcfg)
         st.download_button(
             "⬇️ Download CSV",
             gdf.drop(columns=[
@@ -4643,13 +4766,20 @@ with tab_st:
             score = data.get("score")
             da = data.get("dist_atr")
             anchor_rsi = rsi_cached(s.ticker, anchor_tf)
-            macd_coil = macd_coil_cached(s.ticker, anchor_tf)
-            macd_status_rank = {
-                "Confirmed up-cross": 4,
-                "Coiling - await cross": 3,
-                "Up-cross - weak base": 2,
-                "No confirmation": 1,
-            }.get(macd_coil.get("status") if macd_coil else None, 0)
+            if "Bull" in (data.get("trend") or ""):
+                # Uptrend: confirm with a near-zero MACD coil and up-cross.
+                macd_coil = macd_coil_cached(s.ticker, anchor_tf)
+                macd_status_rank = {
+                    "Confirmed up-cross": 4,
+                    "Coiling - await cross": 3,
+                    "Up-cross - weak base": 2,
+                    "No confirmation": 1,
+                }.get(macd_coil.get("status") if macd_coil else None, 0)
+            else:
+                # Downtrend: an up-cross below zero confirms the reversal.
+                macd_coil = macd_reversal_cached(s.ticker, anchor_tf, lower_tf)
+                macd_status_rank = MACD_REVERSAL_STATUS_RANK.get(
+                    macd_coil.get("status") if macd_coil else None, 0)
             entry = _st_sip_entry(data.get("trend"), score)
             amt = round(cash * entry["pct"] / 100.0)
             performance = supertrend_performance_cached(s.ticker)
@@ -4750,8 +4880,10 @@ with tab_st:
             "ties use ascending reversal score.", True, mkt, "bull")
         _render_st_group(
             bear_rows, f"🔴 Bearish trend ({len(bear_rows)})",
-            "Downtrend — sorted by **MACD confirmation score** (highest first); "
-            "ties use descending reversal score.", False, mkt, "bear")
+            "Downtrend — sorted by **MACD reversal-confirmation score** (highest "
+            "first): an up-cross below zero with a rising histogram confirms the "
+            "reversal score. Ties use descending reversal score.",
+            False, mkt, "bear", st_bear_colcfg)
 
     st.caption(
         "**How to read it:** a rising score across *Score 2w ago → 1w ago → now* means "
